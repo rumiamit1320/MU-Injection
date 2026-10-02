@@ -1,0 +1,1850 @@
+
+import calendar
+import io
+import sqlite3
+import os
+import time
+import secrets
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from copy import copy
+from openpyxl.cell.cell import MergedCell
+
+import openpyxl
+import streamlit as st
+import pandas as pd
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "mu_injection.db"
+TEMPLATE_PATH = APP_DIR / "MU_Injection_Template.xlsx"
+
+TYPE_LABELS = {
+    "A": "Import from GSS",
+    "B": "Import from other circle",
+    "C": "Export to other circle",
+}
+LABEL_TO_TYPE = {v: k for k, v in TYPE_LABELS.items()}
+
+CIRCLE_NAME = "Jorhat Circle"
+DIVISIONS = {"Jorhat-1": "Jorhat-ONE", "Jorhat-2": "Jorhat-TWO", "Teok": "Teok^"}
+DIVISION_TO_ID = {name: i + 1 for i, name in enumerate(DIVISIONS)}
+
+# ---------------- AUTHENTICATION / SESSION CONTROL ----------------
+SESSION_TIMEOUT_SECONDS = 30 * 60
+DEFAULT_USERNAME = os.getenv("MU_ADMIN_USERNAME", "admin")
+DEFAULT_PASSWORD = os.getenv("MU_ADMIN_PASSWORD", "admin123")
+
+def _hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 240000)
+    return salt, digest.hex()
+
+def _verify_password(password, salt, expected_hash):
+    _, digest = _hash_password(password, salt)
+    return secrets.compare_digest(digest, expected_hash)
+
+def ensure_auth_table(con):
+    con.execute("""CREATE TABLE IF NOT EXISTS app_users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        salt TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_login TEXT
+    )""")
+    row = con.execute("SELECT id FROM app_users LIMIT 1").fetchone()
+    if row is None:
+        salt, password_hash = _hash_password(DEFAULT_PASSWORD)
+        con.execute(
+            "INSERT INTO app_users(username,salt,password_hash,active) VALUES(?,?,?,1)",
+            (DEFAULT_USERNAME, salt, password_hash)
+        )
+        con.commit()
+
+def logout():
+    for key in ("authenticated", "auth_username", "last_activity"):
+        st.session_state.pop(key, None)
+
+def render_login(con):
+    if st.session_state.get("authenticated"):
+        last = st.session_state.get("last_activity", time.time())
+        if time.time() - float(last) > SESSION_TIMEOUT_SECONDS:
+            logout()
+            st.session_state["session_expired"] = True
+            st.rerun()
+        st.session_state["last_activity"] = time.time()
+        return True
+
+    st.markdown("""
+    <div class="login-shell">
+      <div class="login-brand">⚡</div>
+      <div class="login-title">MU Injection Manager</div>
+      <div class="login-subtitle">Meter readings • Energy accounting • MU reports</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.0, 1.35, 1.0])
+    with center:
+        st.markdown('<div class="login-anchor"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-heading">Welcome back</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-hint">Sign in to continue to your secure workspace.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-section-label">ACCOUNT</div>', unsafe_allow_html=True)
+        username = st.text_input("Username", placeholder="Enter your username", label_visibility="collapsed", key="login_username")
+        password = st.text_input("Password", type="password", placeholder="Enter your password", label_visibility="collapsed", key="login_password")
+        if st.button("Sign in  →", type="primary", use_container_width=True, key="login_submit"):
+            row = con.execute(
+                "SELECT * FROM app_users WHERE username=? AND active=1 LIMIT 1",
+                (username.strip(),)
+            ).fetchone()
+            if row is not None and _verify_password(password, row["salt"], row["password_hash"]):
+                con.execute("UPDATE app_users SET last_login=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+                con.commit()
+                st.session_state["authenticated"] = True
+                st.session_state["auth_username"] = row["username"]
+                st.session_state["last_activity"] = time.time()
+                st.session_state.pop("session_expired", None)
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+        if st.session_state.get("session_expired"):
+            st.warning("Your session expired due to inactivity. Please sign in again.")
+        st.markdown("""
+        <div class="login-security">
+          <span class="security-dot">●</span>
+          <span>Secure session</span>
+          <span class="security-sep">•</span>
+          <span>30 min inactivity timeout</span>
+        </div>
+        """, unsafe_allow_html=True)
+    return False
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS feeder_master (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        feeder_name TEXT NOT NULL,
+        meter_no TEXT NOT NULL,
+        mf REAL NOT NULL DEFAULT 1,
+        entry_type TEXT NOT NULL CHECK(entry_type IN ('A','B','C')),
+        initial_reading_kwh REAL NOT NULL DEFAULT 0,
+        division_name TEXT,
+        subdivision TEXT,
+        voltage_kv REAL,
+        energy_direction TEXT NOT NULL DEFAULT 'IMPORT' CHECK(energy_direction IN ('IMPORT','EXPORT')),
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(meter_no, entry_type)
+    );
+
+    CREATE TABLE IF NOT EXISTS monthly_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        feeder_id INTEGER NOT NULL,
+        year INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        reading_kwh REAL NOT NULL,
+        remarks TEXT,
+        direct_mu REAL,
+        direct_mu_note TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(feeder_id, year, month),
+        FOREIGN KEY(feeder_id) REFERENCES feeder_master(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_monthly_feeder_date
+      ON monthly_readings(feeder_id, year, month);
+
+    CREATE TABLE IF NOT EXISTS division_master (
+        id INTEGER PRIMARY KEY,
+        circle_name TEXT NOT NULL,
+        division_name TEXT NOT NULL UNIQUE,
+        sheet_name TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS division_row_map (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        division_id INTEGER NOT NULL,
+        sheet_row INTEGER NOT NULL,
+        sub_division TEXT,
+        feeder_id INTEGER NOT NULL,
+        flow_direction TEXT NOT NULL CHECK(flow_direction IN ('IMPORT','EXPORT')),
+        source_feeder_name TEXT,
+        source_meter_no TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(division_id, sheet_row, flow_direction),
+        FOREIGN KEY(division_id) REFERENCES division_master(id) ON DELETE CASCADE,
+        FOREIGN KEY(feeder_id) REFERENCES feeder_master(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_division_map_feeder
+      ON division_row_map(feeder_id, division_id);
+
+    CREATE TABLE IF NOT EXISTS division_row_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        division_map_id INTEGER NOT NULL,
+        year INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        reading_kwh REAL NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(division_map_id, year, month),
+        FOREIGN KEY(division_map_id) REFERENCES division_row_map(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    """)
+    # Division workbooks can contain the same meter number with different
+    # row-level previous readings. Store that historical baseline on the mapping.
+    try:
+        con.execute("ALTER TABLE division_row_map ADD COLUMN baseline_reading_kwh REAL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    for col, typ in [("division_name", "TEXT"), ("subdivision", "TEXT"), ("voltage_kv", "REAL"), ("energy_direction", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE feeder_master ADD COLUMN {col} {typ}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    for col, typ in [("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # Backward compatibility: older databases get an explicit meter energy direction.
+    try:
+        con.execute("UPDATE feeder_master SET energy_direction=CASE WHEN entry_type='C' THEN 'EXPORT' ELSE 'IMPORT' END WHERE energy_direction IS NULL OR energy_direction=''")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Backward compatibility: older versions had an energy_override_mu column.
+    # Manual MU overrides are no longer supported; clear any legacy values and
+    # leave the column unused so existing databases remain compatible.
+    try:
+        con.execute("UPDATE monthly_readings SET energy_override_mu=NULL")
+        con.commit()
+    except sqlite3.OperationalError:
+        pass
+    return con
+
+
+
+def merged_cell_value(ws, row, col):
+    value = ws.cell(row, col).value
+    if value is not None:
+        return value
+    coord = ws.cell(row, col).coordinate
+    for rng in ws.merged_cells.ranges:
+        if coord in rng:
+            return ws.cell(rng.min_row, rng.min_col).value
+    return None
+
+
+def preferred_entry_type_for_flow(flow):
+    return "C" if flow == "EXPORT" else "A"
+
+
+def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="A", year=None, month=None, present=None, division_name=None, subdivision=None, voltage_kv=None, energy_direction=None):
+    meter_no = str(meter_no).strip()
+    feeder_name = str(feeder_name).strip()
+    exact = con.execute(
+        "SELECT * FROM feeder_master WHERE meter_no=? AND entry_type=? ORDER BY id LIMIT 1",
+        (meter_no, preferred_type)
+    ).fetchone()
+    if exact is not None:
+        con.execute(
+            "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (feeder_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"), exact["id"])
+        )
+        return exact["id"], False
+
+    candidates = con.execute(
+        "SELECT * FROM feeder_master WHERE meter_no=? ORDER BY id", (meter_no,)
+    ).fetchall()
+    if candidates:
+        priority = {"C": ["C","B","A"], "A": ["B","A","C"], "B": ["B","A","C"]}.get(
+            preferred_type, [preferred_type,"B","A","C"]
+        )
+        ordered = sorted(
+            candidates,
+            key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
+        )
+
+        # Division workbooks occasionally show the same meter number twice with
+        # different present readings. If a matching monthly reading already
+        # exists, bind the division row to that meter instance.
+        if year is not None and month is not None and present is not None:
+            matching = []
+            for candidate in candidates:
+                rr = con.execute(
+                    "SELECT reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+                    (candidate["id"], year, month)
+                ).fetchone()
+                if rr is not None and abs(float(rr["reading_kwh"]) - float(present)) < 1e-9:
+                    matching.append(candidate)
+            if matching:
+                ordered = sorted(
+                    matching,
+                    key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
+                )
+
+        chosen = ordered[0]
+        fid = chosen["id"]
+        con.execute(
+            "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (feeder_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"), fid)
+        )
+        return fid, False
+
+    con.execute(
+        "INSERT INTO feeder_master (feeder_name,meter_no,mf,entry_type,initial_reading_kwh,division_name,subdivision,voltage_kv,energy_direction) VALUES(?,?,?,?,0,?,?,?,?)",
+        (feeder_name, meter_no, float(mf), preferred_type, division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"))
+    )
+    return con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"], True
+
+
+def ensure_division_master(con):
+    for name, sheet in DIVISIONS.items():
+        con.execute(
+            '''INSERT INTO division_master(id,circle_name,division_name,sheet_name)
+               VALUES(?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 circle_name=excluded.circle_name,
+                 division_name=excluded.division_name,
+                 sheet_name=excluded.sheet_name''',
+            (DIVISION_TO_ID[name], CIRCLE_NAME, name, sheet)
+        )
+    con.commit()
+
+
+def normalize_subdivision(division_name, raw):
+    if division_name == "Jorhat-1":
+        return None
+    text = "" if raw is None else str(raw).strip().upper()
+    for key, value in [("TITABAR","Titabar"),("MARIANI","Mariani"),("MAJULI","Majuli"),("KAKOJAN","Kakojan"),("TEOK","Teok"),
+                       ("JESD-1","JESD-1"),("JESD-I","JESD-1"),("JESD-2","JESD-2"),("JESD-II","JESD-2"),
+                       ("JESD-3","JESD-3"),("JESD-III","JESD-3"),("DERGAON","Dergaon")]:
+        if key in text:
+            return value
+    return None
+
+ALL_SUBDIVISIONS = [
+    "Teok", "Kakojan", "Majuli", "Titabar", "Mariani",
+    "JESD-1", "JESD-2", "JESD-3", "Dergaon"
+]
+
+def allowed_subdivisions(division_name):
+    # Keep one consistent master-data vocabulary across the circle.
+    # Division-specific workbook sections are still mapped separately during
+    # import/report generation; the master dropdown intentionally exposes all
+    # available subdivisions so a newly added feeder can be assigned directly.
+    return ALL_SUBDIVISIONS
+
+def division_flow_from_entry_type(entry_type):
+    return "EXPORT" if entry_type == "C" else "IMPORT"
+
+def division_row_ranges(sheet_name):
+    return {
+        "Jorhat-ONE": [(4,29)],
+        "Jorhat-TWO": [(5,10),(13,21),(24,26)],
+        "Teok^": [(5,19),(22,29)],
+    }.get(sheet_name, [])
+
+
+def import_division_workbook(con, uploaded_bytes, year, month, division_name, overwrite=False):
+    if division_name not in DIVISIONS:
+        raise ValueError("Unknown division.")
+    sheet_name = DIVISIONS[division_name]
+    wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Workbook does not contain the '{sheet_name}' sheet.")
+    ws = wb[sheet_name]
+    div_id = DIVISION_TO_ID[division_name]
+
+    imported = reused = new_master = mapped = 0
+    skipped = []
+
+    try:
+        con.execute("BEGIN")
+        for start, end in division_row_ranges(sheet_name):
+            current_sub = None
+            for r in range(start, end + 1):
+                a = merged_cell_value(ws, r, 1)
+                b = merged_cell_value(ws, r, 2)
+                d = merged_cell_value(ws, r, 4)
+                e = merged_cell_value(ws, r, 5)
+                voltage = merged_cell_value(ws, r, 3)
+                f = merged_cell_value(ws, r, 6)
+                g = merged_cell_value(ws, r, 7)
+                i_cell = ws.cell(r, 9).value
+                j_cell = ws.cell(r, 10).value
+
+                if isinstance(a, str) and "SUB-DIVISION" in a.upper():
+                    current_sub = a.strip()
+                    continue
+                if not isinstance(f, (int, float)) and not isinstance(g, (int, float)):
+                    continue
+                if d is None and b is None:
+                    continue
+
+                feeder_name = str(b).strip() if b is not None else f"{division_name} row {r}"
+                meter = str(d).strip() if d is not None else f"__{sheet_name}__ROW__{r}"
+                mf = _to_float(e) or 1.0
+                present = _to_float(g)
+                last = _to_float(f)
+                if present is None:
+                    skipped.append(f"Row {r}: {feeder_name} — present reading is blank")
+                    continue
+
+                flows = []
+                if i_cell is not None:
+                    flows.append("IMPORT")
+                if j_cell is not None:
+                    flows.append("EXPORT")
+                if not flows:
+                    continue
+
+                for flow in flows:
+                    fid, created = find_or_create_meter_master(
+                        con, feeder_name, meter, mf, preferred_entry_type_for_flow(flow),
+                        year, month, present, division_name,
+                        normalize_subdivision(division_name, current_sub), _to_float(voltage), flow
+                    )
+                    new_master += int(created)
+
+                    existing = con.execute(
+                        "SELECT id FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+                        (fid, year, month)
+                    ).fetchone()
+
+                    prior = con.execute(
+                        '''SELECT 1 FROM monthly_readings
+                           WHERE feeder_id=? AND
+                           (year < ? OR (year=? AND month < ?)) LIMIT 1''',
+                        (fid, year, year, month)
+                    ).fetchone()
+                    if existing is None and prior is None and last is not None:
+                        con.execute(
+                            "UPDATE feeder_master SET initial_reading_kwh=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (last, fid)
+                        )
+
+                    if existing is None:
+                        con.execute(
+                            "INSERT INTO monthly_readings (feeder_id,year,month,reading_kwh,remarks) VALUES(?,?,?,?,?)",
+                            (fid, year, month, present, f"Imported from {division_name}")
+                        )
+                        imported += 1
+                    elif overwrite:
+                        # The master monthly reading is shared, but a division
+                        # workbook can contain the same meter more than once
+                        # with different import/export readings.  The exact
+                        # row-level value is stored separately below.
+                        con.execute(
+                            "UPDATE monthly_readings SET reading_kwh=?, remarks=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (present, f"Imported from {division_name}", existing["id"])
+                        )
+                        reused += 1
+                    else:
+                        reused += 1
+
+                    con.execute(
+                        '''INSERT INTO division_row_map
+                           (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh)
+                           VALUES(?,?,?,?,?,?,?,?)
+                           ON CONFLICT(division_id,sheet_row,flow_direction)
+                           DO UPDATE SET feeder_id=excluded.feeder_id,
+                             sub_division=excluded.sub_division,
+                             source_feeder_name=excluded.source_feeder_name,
+                             source_meter_no=excluded.source_meter_no,
+                             baseline_reading_kwh=excluded.baseline_reading_kwh,
+                             active=1''',
+                        (div_id, r, current_sub, fid, flow, feeder_name, meter, last)
+                    )
+                    map_row = con.execute(
+                        "SELECT id FROM division_row_map WHERE division_id=? AND sheet_row=? AND flow_direction=?",
+                        (div_id, r, flow)
+                    ).fetchone()
+                    if map_row is not None:
+                        con.execute(
+                            """INSERT INTO division_row_readings (division_map_id,year,month,reading_kwh)
+                               VALUES(?,?,?,?)
+                               ON CONFLICT(division_map_id,year,month) DO UPDATE SET
+                                 reading_kwh=excluded.reading_kwh, updated_at=CURRENT_TIMESTAMP""",
+                            (map_row["id"], year, month, present)
+                        )
+                    mapped += 1
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+    return {"imported": imported, "reused": reused, "new_master": new_master,
+            "mapped": mapped, "skipped": skipped}
+
+
+
+def import_all_division_workbook(con, uploaded_bytes, year, month, overwrite=False):
+    wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
+    results = []
+    for division_name, sheet_name in DIVISIONS.items():
+        if sheet_name in wb.sheetnames:
+            results.append(
+                import_division_workbook(
+                    con, uploaded_bytes, year, month, division_name, overwrite
+                )
+            )
+    if not results:
+        raise ValueError("No Jorhat division sheets were found in the uploaded workbook.")
+    return {
+        "divisions": len(results),
+        "imported": sum(x["imported"] for x in results),
+        "reused": sum(x["reused"] for x in results),
+        "new_master": sum(x["new_master"] for x in results),
+        "mapped": sum(x["mapped"] for x in results),
+        "skipped": [item for x in results for item in x["skipped"]],
+    }
+
+
+def bootstrap_division_template(con):
+    div_path = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
+    if not div_path.exists():
+        return
+    ensure_division_master(con)
+    try:
+        data = div_path.read_bytes()
+        for division_name in DIVISIONS:
+            n = con.execute(
+                "SELECT COUNT(*) n FROM division_row_map WHERE division_id=?",
+                (DIVISION_TO_ID[division_name],)
+            ).fetchone()["n"]
+            if n == 0:
+                import_division_workbook(con, data, 2026, 6, division_name, False)
+    except Exception:
+        pass
+
+
+def get_division_id(con, division_name):
+    row = con.execute(
+        "SELECT id FROM division_master WHERE division_name=?", (division_name,)
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def get_scope_rows(con, year, month, scope, division_name=None):
+    if scope == "Circle":
+        return get_reading_rows(con, year, month)
+    div_id = get_division_id(con, division_name)
+    if div_id is None:
+        return []
+    return con.execute(
+        '''SELECT DISTINCT f.*, r.id AS reading_id, r.reading_kwh, r.remarks, r.direct_mu, r.direct_mu_note
+           FROM feeder_master f
+           LEFT JOIN division_row_map dm ON dm.feeder_id=f.id AND dm.division_id=? AND dm.active=1
+           LEFT JOIN monthly_readings r
+             ON r.feeder_id=f.id AND r.year=? AND r.month=?
+           WHERE f.active=1 AND (dm.feeder_id IS NOT NULL OR f.division_name=?)
+           ORDER BY f.subdivision, f.feeder_name, f.meter_no''',
+        (div_id, year, month, division_name)
+    ).fetchall()
+
+
+def division_energy_summary(con, year, month, division_name):
+    div_id = get_division_id(con, division_name)
+    totals = {"IMPORT": 0.0, "EXPORT": 0.0}
+    if div_id is None:
+        totals["NET"] = 0.0; return totals
+    maps = con.execute(
+        """SELECT m.*, f.mf, r.reading_kwh AS master_reading, r.direct_mu AS master_direct_mu, dr.reading_kwh AS row_reading
+           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
+           LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+           WHERE m.division_id=? AND m.active=1""",
+        (year, month, year, month, div_id)).fetchall()
+    for row in maps:
+        if row["master_direct_mu"] is not None:
+            energy_mwh=float(row["master_direct_mu"])*1000.0
+        else:
+            present = row["row_reading"] if row["row_reading"] is not None else row["master_reading"]
+            if present is None: continue
+            prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (row["feeder_id"],year,year,month)).fetchone()
+            prev = float(row["baseline_reading_kwh"]) if prior is None and row["baseline_reading_kwh"] is not None else get_previous_reading(con,row["feeder_id"],year,month)
+            if prev is None: continue
+            energy_mwh=(float(present)-prev)*float(row["mf"])
+        totals[row["flow_direction"]]+=energy_mwh
+    totals["NET"]=totals["IMPORT"]-totals["EXPORT"]
+    return totals
+
+
+def insert_rows_preserve_merges(ws, idx, amount, copy_from):
+    ranges=[]
+    for rng in list(ws.merged_cells.ranges):
+        ranges.append((rng.min_col,rng.min_row,rng.max_col,rng.max_row))
+    for rng in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(rng))
+    ws.insert_rows(idx, amount=amount)
+    for rr in range(idx, idx+amount):
+        copy_row(ws, copy_from, rr)
+    for min_col,min_row,max_col,max_row in ranges:
+        if min_row >= idx:
+            min_row += amount; max_row += amount
+        elif min_row < idx <= max_row:
+            max_row += amount
+        ws.merge_cells(start_row=min_row,start_column=min_col,end_row=max_row,end_column=max_col)
+
+def division_report(con, year, month, division_name):
+    template = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
+    wb = openpyxl.load_workbook(template)
+    sheet_name = DIVISIONS[division_name]
+    ws = wb[sheet_name]
+    div_id = get_division_id(con, division_name)
+
+    next_month = 1 if month == 12 else month + 1
+    next_year = year + 1 if month == 12 else year
+    ws["A2"] = (f"For the month of {calendar.month_name[month]}, {year} "
+                f"(Billed in {calendar.month_name[next_month]} , {next_year})")
+
+    sections = {
+        "Jorhat-ONE": [(None, 4, 29, 31)],
+        "Jorhat-TWO": [("Titabar", 5, 10, 11), ("Mariani", 13, 21, 22), ("Majuli", 24, 26, 27)],
+        "Teok^": [("Teok", 5, 19, 20), ("Kakojan", 22, 29, 30)],
+    }[sheet_name]
+
+    negative_maps = con.execute(
+        """SELECT m.*, f.feeder_name, f.meter_no, f.mf, f.voltage_kv, r.reading_kwh
+           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
+           WHERE m.division_id=? AND m.active=1 AND m.sheet_row < 0
+           ORDER BY m.sub_division, f.feeder_name, f.meter_no""",
+        (year, month, div_id)).fetchall()
+
+    insertion_by_sub = {}
+    for sub, start_row, end_row, total_row in sections:
+        insertion_by_sub[sub] = sum(1 for x in negative_maps if (x["sub_division"] or None) == sub)
+
+    for sub, start_row, end_row, total_row in reversed(sections):
+        count = insertion_by_sub[sub]
+        if count:
+            copy_from = start_row
+            insert_rows_preserve_merges(ws, total_row, count, copy_from)
+
+    shift = 0
+    live_sections = []
+    for sub, start_row, end_row, total_row in sections:
+        start_row += shift; end_row += shift; total_row += shift
+        count = insertion_by_sub[sub]
+        end_row += count; total_row += count
+        live_sections.append((sub, start_row, end_row, total_row))
+        shift += count
+
+    for sub, start_row, end_row, total_row in live_sections:
+        for r in range(start_row, end_row + 1):
+            for c in range(6, 13):
+                ws.cell(r, c).value = None
+
+    maps = con.execute(
+        """SELECT m.sheet_row, m.sub_division, m.flow_direction, m.feeder_id,
+                  m.baseline_reading_kwh, f.feeder_name, f.meter_no, f.mf,
+                  f.voltage_kv, r.reading_kwh AS master_reading, r.direct_mu AS master_direct_mu, dr.reading_kwh AS row_reading
+           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
+           LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+           WHERE m.division_id=? AND m.active=1
+           ORDER BY m.sheet_row, m.flow_direction""",
+        (year, month, year, month, div_id)).fetchall()
+
+    used_rows = {x["sheet_row"] for x in maps if x["sheet_row"] > 0}
+    allocated = []
+    for sub, start_row, end_row, total_row in live_sections:
+        new_items = [x for x in maps if x["sheet_row"] < 0 and (x["sub_division"] or None) == sub]
+        free = [r for r in range(end_row - len(new_items) + 1, end_row + 1) if r not in used_rows]
+        for item, rr in zip(new_items, free):
+            allocated.append((rr, item)); used_rows.add(rr)
+
+    rows_by_row = {}
+    for row in maps:
+        if row["sheet_row"] > 0:
+            rows_by_row.setdefault(row["sheet_row"], []).append(row)
+    for rr, item in allocated:
+        rows_by_row.setdefault(rr, []).append(item)
+
+    for r, rowmaps in sorted(rows_by_row.items()):
+        base = rowmaps[0]
+        present = base["row_reading"] if base["row_reading"] is not None else base["master_reading"]
+        direct_mu = base["master_direct_mu"]
+        flows = {x["flow_direction"] for x in rowmaps}
+        if direct_mu is not None:
+            # Meter unavailable/defective: write the supplied MU directly.
+            # Import is positive; Export is negative in Net Energy Injection.
+            signed_mu = float(direct_mu) * (-1 if "EXPORT" in flows and "IMPORT" not in flows else 1)
+            ws.cell(r, 11).value = signed_mu * 1000.0
+            ws.cell(r, 12).value = signed_mu
+            if not isinstance(ws.cell(r,2), MergedCell): ws.cell(r,2).value = base["feeder_name"]
+            if not isinstance(ws.cell(r,4), MergedCell): ws.cell(r,4).value = base["meter_no"]
+            if not isinstance(ws.cell(r,5), MergedCell): ws.cell(r,5).value = base["mf"]
+            if not isinstance(ws.cell(r,3), MergedCell): ws.cell(r,3).value = base["voltage_kv"]
+            continue
+        if present is None:
+            continue
+        prev = get_previous_reading(con, base["feeder_id"], year, month)
+        prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (base["feeder_id"], year, year, month)).fetchone()
+        if prior is None and base["baseline_reading_kwh"] is not None:
+            prev = float(base["baseline_reading_kwh"])
+        if prev is None:
+            continue
+        ws.cell(r, 6).value = prev
+        ws.cell(r, 7).value = present
+        ws.cell(r, 8).value = f"=G{r}-F{r}"
+        if not isinstance(ws.cell(r,5), MergedCell): ws.cell(r,5).value = base["mf"]
+        if not isinstance(ws.cell(r,4), MergedCell): ws.cell(r,4).value = base["meter_no"]
+        if not isinstance(ws.cell(r,3), MergedCell): ws.cell(r,3).value = base["voltage_kv"]
+        if not isinstance(ws.cell(r,2), MergedCell): ws.cell(r,2).value = base["feeder_name"]
+        if "IMPORT" in flows: ws.cell(r, 9).value = f"=H{r}*E{r}"
+        if "EXPORT" in flows: ws.cell(r, 10).value = f"=H{r}*E{r}"
+        if flows:
+            ws.cell(r, 11).value = f"=I{r}-J{r}"
+            ws.cell(r, 12).value = f"=K{r}/1000"
+
+    if sheet_name == "Jorhat-ONE":
+        _, a_start, a_end, a_total = live_sections[0]
+        ws.cell(a_total, 11).value = "TOTAL:-"; ws.cell(a_total, 12).value = f"=SUM(L{a_start}:L{a_end})"
+        summary_row = None
+        final_row = None
+        for rr in range(1, ws.max_row+1):
+            text=ws.cell(rr,2).value
+            if isinstance(text,str) and "TOTAL ENERGY INJECTION" in text: summary_row=rr
+            if isinstance(text,str) and text.strip().startswith("JORHAT-ONE") : final_row=rr
+        if summary_row: ws.cell(summary_row,9).value=f"=L{a_total}"
+        if final_row and summary_row: ws.cell(final_row,7).value=f"=I{summary_row}"
+    elif sheet_name == "Teok^":
+        _, a_start, a_end, a_total = live_sections[0]; _, b_start, b_end, b_total = live_sections[1]
+        ws.cell(a_total,11).value="TOTAL:-"; ws.cell(a_total,12).value=f"=SUM(L{a_start}:L{a_end})"
+        ws.cell(b_total,11).value="TOTAL:-"; ws.cell(b_total,12).value=f"=SUM(L{b_start}:L{b_end})"
+        teok_sum = kakojan_sum = total_power = None
+        for r in range(1,ws.max_row+1):
+            texts=[ws.cell(r,c).value for c in range(1, min(ws.max_column,12)+1)]
+            joined=" | ".join(str(x) for x in texts if x is not None)
+            if "ENERGY INJECTED TO TEOK ELEC. SUB-DIV" in joined:
+                teok_sum=r; ws.cell(r,9).value=f"=L{a_total}"
+            elif "ENERGY INJECTED TO KAKOJAN ELEC. SUB-DIV" in joined:
+                kakojan_sum=r; ws.cell(r,9).value=f"=L{b_total}"
+            elif "TOTAL POWER" in joined:
+                total_power=r
+        if total_power and teok_sum and kakojan_sum: ws.cell(total_power,9).value=f"=I{teok_sum}+I{kakojan_sum}"
+    elif sheet_name == "Jorhat-TWO":
+        totals=[]
+        for sub,a_start,a_end,a_total in live_sections:
+            ws.cell(a_total,11).value="TOTAL:-"; ws.cell(a_total,12).value=f"=SUM(L{a_start}:L{a_end})"; totals.append(a_total)
+        sum_rows=[]; total_div=None
+        for r in range(1,ws.max_row+1):
+            texts=[ws.cell(r,c).value for c in range(1,min(ws.max_column,12)+1)]
+            joined=" | ".join(str(x) for x in texts if x is not None)
+            if "ENERGY INJECTED TO TITABAR" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[0]}"
+            elif "ENERGY INJECTED TO MARIANI" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[1]}"
+            elif "ENERGY INJECTED TO MAJULI" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[2]}"
+            elif "TOTAL ENERGY INJECTION" in joined: total_div=r
+        if total_div and len(sum_rows)==3: ws.cell(total_div,12).value="="+"+".join(f"I{x}" for x in sum_rows)
+
+    try:
+        wb.calculation.fullCalcOnLoad=True; wb.calculation.forceFullCalc=True; wb.calculation.calcMode="auto"
+    except Exception: pass
+    out=io.BytesIO(); wb.save(out); out.seek(0); return out
+
+
+def bootstrap_from_template(con):
+    """Seed feeder master + June 2026 readings from the supplied workbook once."""
+    if not TEMPLATE_PATH.exists():
+        return
+    existing = con.execute("SELECT COUNT(*) n FROM feeder_master").fetchone()["n"]
+    if existing:
+        return
+
+    try:
+        wb = openpyxl.load_workbook(TEMPLATE_PATH, data_only=False)
+        ws = wb["MU inj JEC"]
+    except Exception:
+        return
+
+    ranges = {"A": range(7,31), "B": range(34,43), "C": range(46,51)}
+    for sec, rows in ranges.items():
+        for r in rows:
+            feeder = ws.cell(r,2).value
+            meter = ws.cell(r,3).value
+            last = ws.cell(r,4).value
+            present = ws.cell(r,5).value
+            mf = ws.cell(r,7).value
+            remarks = ws.cell(r,9).value
+            if feeder is None:
+                continue
+
+            feeder = str(feeder).strip()
+            meter = str(meter).strip() if meter is not None else ""
+            if not meter:
+                continue
+            mf = float(mf) if isinstance(mf,(int,float)) else 1.0
+            initial = float(last) if isinstance(last,(int,float)) else 0.0
+            present = float(present) if isinstance(present,(int,float)) else None
+
+            try:
+                con.execute("""
+                    INSERT INTO feeder_master
+                    (feeder_name,meter_no,mf,entry_type,initial_reading_kwh,energy_direction)
+                    VALUES(?,?,?,?,?,?)
+                """,(feeder,meter,mf,sec,initial, "EXPORT" if sec=="C" else "IMPORT"))
+            except sqlite3.IntegrityError:
+                continue
+
+            fid = con.execute("""
+                SELECT id FROM feeder_master
+                WHERE meter_no=? AND entry_type=?
+            """,(meter,sec)).fetchone()["id"]
+
+            if present is not None:
+                # The supplied workbook is June 2026.
+                con.execute("""
+                    INSERT OR IGNORE INTO monthly_readings
+                    (feeder_id,year,month,reading_kwh,remarks)
+                    VALUES(?,?,?,?,?)
+                """,(fid,2026,6,present,remarks))
+
+    con.commit()
+
+def previous_period(year, month):
+    return (year-1,12) if month == 1 else (year,month-1)
+
+def get_previous_reading(con, feeder_id, year, month):
+    py, pm = previous_period(year, month)
+    row = con.execute("""
+        SELECT reading_kwh
+        FROM monthly_readings
+        WHERE feeder_id=? AND year=? AND month=?
+    """, (feeder_id, py, pm)).fetchone()
+    if row is not None:
+        return float(row["reading_kwh"])
+
+    # If there is no previous monthly record, use the feeder's initial reading
+    # only for the first monthly reading.
+    row = con.execute("""
+        SELECT initial_reading_kwh
+        FROM feeder_master WHERE id=?
+    """, (feeder_id,)).fetchone()
+    return None if row is None else float(row["initial_reading_kwh"])
+
+def save_reading(con, feeder_id, year, month, reading_kwh, remarks=""):
+    con.execute("""
+        INSERT INTO monthly_readings
+            (feeder_id,year,month,reading_kwh,remarks)
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(feeder_id,year,month)
+        DO UPDATE SET
+            reading_kwh=excluded.reading_kwh,
+            remarks=excluded.remarks,
+            direct_mu=NULL,
+            direct_mu_note=NULL,
+            updated_at=CURRENT_TIMESTAMP
+    """, (feeder_id,year,month,reading_kwh,remarks))
+    con.execute("""
+        UPDATE division_row_readings
+        SET reading_kwh=?, updated_at=CURRENT_TIMESTAMP
+        WHERE division_map_id IN (SELECT id FROM division_row_map WHERE feeder_id=?)
+          AND year=? AND month=?
+    """, (reading_kwh, feeder_id, year, month))
+    con.commit()
+
+def delete_reading(con, feeder_id, year, month):
+    con.execute("""
+        DELETE FROM monthly_readings
+        WHERE feeder_id=? AND year=? AND month=?
+    """, (feeder_id,year,month))
+    con.execute("""
+        DELETE FROM division_row_readings
+        WHERE division_map_id IN (SELECT id FROM division_row_map WHERE feeder_id=?)
+          AND year=? AND month=?
+    """, (feeder_id,year,month))
+    con.commit()
+
+def add_feeder(con, feeder_name, meter_no, mf, entry_type, initial, division_name, subdivision, voltage_kv, energy_direction):
+    flow_dir = energy_direction if energy_direction in ('IMPORT', 'EXPORT') else division_flow_from_entry_type(entry_type)
+    con.execute("""INSERT INTO feeder_master
+        (feeder_name,meter_no,mf,entry_type,initial_reading_kwh,division_name,subdivision,voltage_kv,energy_direction)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
+        (feeder_name.strip(),meter_no.strip(),float(mf),entry_type,float(initial),division_name,subdivision,voltage_kv,flow_dir))
+    fid=con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    if division_name:
+        div_id=get_division_id(con, division_name)
+        if div_id:
+            con.execute("""INSERT OR IGNORE INTO division_row_map
+                (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (div_id,-fid,subdivision,fid,flow_dir,feeder_name,meter_no,initial))
+    con.commit()
+
+def update_feeder(con, feeder_id, feeder_name, meter_no, mf, entry_type, initial, division_name, subdivision, voltage_kv, energy_direction):
+    flow_dir = energy_direction if energy_direction in ('IMPORT', 'EXPORT') else division_flow_from_entry_type(entry_type)
+    con.execute("""UPDATE feeder_master
+        SET feeder_name=?,meter_no=?,mf=?,entry_type=?,initial_reading_kwh=?,
+            division_name=?,subdivision=?,voltage_kv=?,energy_direction=?,updated_at=CURRENT_TIMESTAMP
+        WHERE id=?""",
+        (feeder_name.strip(),meter_no.strip(),float(mf),entry_type,float(initial),division_name,subdivision,voltage_kv,flow_dir,feeder_id))
+    con.execute("DELETE FROM division_row_map WHERE feeder_id=? AND sheet_row < 0",(feeder_id,))
+    if division_name:
+        div_id=get_division_id(con, division_name)
+        if div_id:
+            con.execute("""INSERT OR IGNORE INTO division_row_map
+                (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (div_id,-feeder_id,subdivision,feeder_id,flow_dir,feeder_name,meter_no,initial))
+    con.commit()
+
+def delete_feeder(con, feeder_id):
+    con.execute("DELETE FROM feeder_master WHERE id=?", (feeder_id,))
+    con.commit()
+
+def get_feeders(con, active_only=True):
+    sql = "SELECT * FROM feeder_master"
+    if active_only:
+        sql += " WHERE active=1"
+    sql += " ORDER BY entry_type, feeder_name, meter_no"
+    return con.execute(sql).fetchall()
+
+def get_reading_rows(con, year, month):
+    return con.execute("""
+        SELECT f.*, r.id AS reading_id, r.reading_kwh, r.remarks, r.direct_mu, r.direct_mu_note
+        FROM feeder_master f
+        LEFT JOIN monthly_readings r
+          ON r.feeder_id=f.id AND r.year=? AND r.month=?
+        WHERE f.active=1
+        ORDER BY f.entry_type, f.feeder_name, f.meter_no
+    """, (year,month)).fetchall()
+
+def calculate_mu(con, row, year, month):
+    if row["reading_id"] is None:
+        return None
+    # A direct MU entry is a month-specific fallback for lost/defective meters.
+    # It is stored as a positive magnitude; report logic applies Import/Export sign.
+    if row["direct_mu"] is not None:
+        return float(row["direct_mu"])
+    prev = get_previous_reading(con, row["id"], year, month)
+    if prev is None:
+        return None
+    return (float(row["reading_kwh"]) - prev) * float(row["mf"]) / 1000.0
+
+
+def _to_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_section_rows(ws, sec):
+    """Find data rows for section A/B/C in the supplied monthly workbook."""
+    header_tokens = {"A": "A.", "B": "B.", "C": "C."}
+    subtotal_tokens = {"A": "SUB-TOTAL (A)", "B": "SUB-TOTAL (B)", "C": "SUB-TOTAL (C)"}
+    header = None
+    subtotal = None
+    for r in range(1, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, 4)]
+        text = " ".join(str(v).strip() for v in vals if v is not None)
+        if header is None and header_tokens[sec] in text:
+            header = r
+        if subtotal_tokens[sec] in text:
+            subtotal = r
+            break
+    if header is None or subtotal is None or subtotal <= header + 1:
+        return []
+    return list(range(header + 1, subtotal))
+
+
+def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
+    """Import one monthly MU workbook using only meter readings and MF.
+
+    The workbook's Last Reading is used as the feeder's initial baseline when
+    the database has no monthly reading before the imported month. This makes
+    a historical import such as January 2026 self-contained: January Present
+    becomes the stored January reading and January Last becomes its baseline.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
+    ws = wb["MU inj JEC"] if "MU inj JEC" in wb.sheetnames else wb.active
+    imported = []
+    skipped = []
+    updated_master = 0
+    new_master = 0
+    overwritten = 0
+
+    try:
+        con.execute("BEGIN")
+        for sec in ["A", "B", "C"]:
+            for r in _find_section_rows(ws, sec):
+                feeder = ws.cell(r, 2).value
+                meter = ws.cell(r, 3).value
+                last = _to_float(ws.cell(r, 4).value)
+                present = _to_float(ws.cell(r, 5).value)
+                mf = _to_float(ws.cell(r, 7).value)
+                remarks = ws.cell(r, 9).value
+
+                if feeder is None or str(feeder).strip() == "":
+                    continue
+                feeder = str(feeder).strip()
+                meter = "" if meter is None else str(meter).strip()
+                if not meter:
+                    skipped.append(f"{sec}: {feeder} — meter number is blank")
+                    continue
+                if present is None:
+                    skipped.append(f"{sec}: {feeder} / {meter} — present reading is blank")
+                    continue
+                mf = 1.0 if mf is None else mf
+
+                feeder_id, created_master = find_or_create_meter_master(
+                    con, feeder, meter, mf, sec
+                )
+                if created_master:
+                    new_master += 1
+                    if last is not None:
+                        con.execute("""
+                            UPDATE feeder_master
+                            SET initial_reading_kwh=?, updated_at=CURRENT_TIMESTAMP
+                            WHERE id=?
+                        """, (last, feeder_id))
+                else:
+                    updated_master += 1
+                    if last is not None:
+                        prior = con.execute("""
+                            SELECT 1 FROM monthly_readings
+                            WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?))
+                            LIMIT 1
+                        """, (feeder_id, year, year, month)).fetchone()
+                        if prior is None:
+                            con.execute("""
+                                UPDATE feeder_master
+                                SET initial_reading_kwh=?, updated_at=CURRENT_TIMESTAMP
+                                WHERE id=?
+                            """, (last, feeder_id))
+
+                existing = con.execute("""
+                    SELECT id FROM monthly_readings
+                    WHERE feeder_id=? AND year=? AND month=?
+                """, (feeder_id, year, month)).fetchone()
+                if existing is not None and not overwrite:
+                    skipped.append(f"{sec}: {feeder} / {meter} — monthly reading already exists")
+                    continue
+
+                # MU is deliberately NOT imported from the workbook. It is
+                # always calculated by the application from Present-Last and MF.
+                con.execute("""
+                    INSERT INTO monthly_readings
+                    (feeder_id,year,month,reading_kwh,remarks)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(feeder_id,year,month)
+                    DO UPDATE SET
+                        reading_kwh=excluded.reading_kwh,
+                        remarks=excluded.remarks,
+                        updated_at=CURRENT_TIMESTAMP
+                """, (feeder_id, year, month, present, remarks))
+                if existing is not None:
+                    overwritten += 1
+                else:
+                    imported.append(feeder)
+
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+    return {
+        "imported": len(imported),
+        "new_master": new_master,
+        "updated_master": updated_master,
+        "overwritten": overwritten,
+        "skipped": skipped,
+    }
+
+
+def month_energy_summary(con, year, month):
+    rows = get_reading_rows(con, year, month)
+    totals = {"A": 0.0, "B": 0.0, "C": 0.0}
+    for row in rows:
+        if row["reading_id"] is not None:
+            mu = calculate_mu(con, row, year, month)
+            if mu is not None:
+                totals[row["entry_type"]] += mu
+    totals["NET"] = totals["A"] + totals["B"] - totals["C"]
+    return totals
+
+def copy_style(src, dst):
+    if src.has_style:
+        dst._style = copy(src._style)
+    if src.number_format:
+        dst.number_format = src.number_format
+    dst.font = copy(src.font)
+    dst.fill = copy(src.fill)
+    dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment)
+    dst.protection = copy(src.protection)
+
+def copy_row(ws, src_row, dst_row):
+    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+    for c in range(1, ws.max_column+1):
+        copy_style(ws.cell(src_row,c), ws.cell(dst_row,c))
+
+def build_report(con, year, month):
+    wb = openpyxl.load_workbook(TEMPLATE_PATH)
+    ws = wb["MU inj JEC"]
+
+    # Build section rows dynamically while retaining the supplied template's
+    # visual style. Original template capacities are A=24, B=9, C=5.
+    sections = {
+        "A": [7,30,32],
+        "B": [34,42,44],
+        "C": [46,50,51],
+    }
+
+    for sec in ["A","B","C"]:
+        rows = con.execute("""
+            SELECT f.*, r.reading_kwh, r.direct_mu
+            FROM feeder_master f
+            LEFT JOIN monthly_readings r
+              ON r.feeder_id=f.id AND r.year=? AND r.month=?
+            WHERE f.active=1 AND f.entry_type=?
+            ORDER BY f.feeder_name, f.meter_no
+        """, (year,month,sec)).fetchall()
+
+        start,end,subtotal = sections[sec]
+        capacity=end-start+1
+        if len(rows)>capacity:
+            extra=len(rows)-capacity
+            ws.insert_rows(subtotal, amount=extra)
+            for rr in range(subtotal,subtotal+extra):
+                copy_row(ws,end,rr)
+            end += extra
+            subtotal += extra
+            sections[sec]=[start,end,subtotal]
+            # Inserting rows shifts later sections.
+            if sec=="A":
+                sections["B"][0]+=extra; sections["B"][1]+=extra; sections["B"][2]+=extra
+                sections["C"][0]+=extra; sections["C"][1]+=extra; sections["C"][2]+=extra
+            elif sec=="B":
+                sections["C"][0]+=extra; sections["C"][1]+=extra; sections["C"][2]+=extra
+
+    for sec in ["A","B","C"]:
+        start,end,subtotal=sections[sec]
+        for r in range(start,end+1):
+            for c in range(1,10):
+                ws.cell(r,c).value=None
+
+        rows=con.execute("""
+            SELECT f.*, r.reading_kwh, r.direct_mu
+            FROM feeder_master f
+            LEFT JOIN monthly_readings r
+              ON r.feeder_id=f.id AND r.year=? AND r.month=?
+            WHERE f.active=1 AND f.entry_type=?
+            ORDER BY f.feeder_name, f.meter_no
+        """,(year,month,sec)).fetchall()
+
+        for i,row in enumerate(rows,1):
+            r=start+i-1
+            direct_mu=row["direct_mu"]
+            present=row["reading_kwh"]
+            prev=get_previous_reading(con,row["id"],year,month) if present is not None else None
+            diff=None if prev is None else float(present)-prev
+            mu=float(direct_mu) if direct_mu is not None else (None if diff is None else diff*float(row["mf"])/1000)
+            ws.cell(r,1).value=i
+            ws.cell(r,2).value=row["feeder_name"]
+            ws.cell(r,3).value=row["meter_no"]
+            ws.cell(r,4).value=prev
+            ws.cell(r,5).value=present
+            ws.cell(r,6).value=f"=E{r}-D{r}"
+            ws.cell(r,7).value=row["mf"]
+            if mu is not None:
+                ws.cell(r,8).value=mu
+            else:
+                ws.cell(r,8).value=f"=F{r}*G{r}/1000"
+
+        ws.cell(subtotal,8).value=f"=SUM(H{start}:H{end})"
+
+    a_start,a_end,a_sub=sections["A"]
+    b_start,b_end,b_sub=sections["B"]
+    c_start,c_end,c_sub=sections["C"]
+
+    ws.cell(a_sub,1).value="SUB-TOTAL (A)"
+    ws.cell(b_sub,2).value="            SUB-TOTAL (B)"
+    ws.cell(c_sub,2).value="              SUB-TOTAL (C)"
+
+    total_row=c_sub+1
+    ws.cell(total_row,1).value="TOTAL ENERGY INJECTED = (A+B)-C"
+    ws.cell(total_row,8).value=f"=(H{a_sub}+H{b_sub})-H{c_sub}"
+
+    received_row=total_row+2
+    ws.cell(received_row,1).value="TOTAL ENERGY RECEIVED BY THE CIRCLE:-"
+    ws.cell(received_row,6).value=f"=H{total_row}"
+    ws.cell(received_row,8).value="MU"
+
+    oa_row=received_row+2
+    ws.cell(oa_row,1).value="D."
+    ws.cell(oa_row,2).value="OPEN ACCESS ENERGY"
+    ws.cell(oa_row,8).value="ENERGY (In M.U.)"
+    ws.cell(oa_row,9).value="REMARKS"
+
+    try:
+        wb.calculation.fullCalcOnLoad=True
+        wb.calculation.forceFullCalc=True
+        wb.calculation.calcMode="auto"
+    except Exception:
+        pass
+
+    out=io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out
+
+def style():
+    st.markdown("""
+    <style>
+    .stApp { background:#0e1117; color:#f8fafc; }
+    .block-container { max-width:1500px; padding-top:1rem; }
+    .hero {
+      background:linear-gradient(135deg,#0f172a,#1d4ed8);
+      padding:24px 28px;border-radius:18px;color:white;margin-bottom:18px;
+      box-shadow:0 8px 30px rgba(0,0,0,.30);
+    }
+    .hero h1{margin:0;font-size:30px;color:white}.hero p{margin:5px 0 0;color:#dbeafe}
+    .card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:16px;
+          box-shadow:0 3px 12px rgba(0,0,0,.20)}
+    .login-shell { text-align:center; margin:7vh auto 30px; }
+    .login-brand { width:70px; height:70px; margin:0 auto 17px; border-radius:20px;
+      display:flex; align-items:center; justify-content:center; font-size:36px;
+      background:linear-gradient(145deg,#ff9d1c 0%,#ff4d4f 100%);
+      border:1px solid rgba(255,255,255,.14);
+      box-shadow:0 14px 38px rgba(249,115,22,.22), inset 0 1px 0 rgba(255,255,255,.18); }
+    .login-title { font-size:36px; font-weight:800; color:#f8fafc; letter-spacing:-1px; }
+    .login-subtitle { margin-top:8px; color:#94a3b8; font-size:14px; letter-spacing:.1px; }
+    div[data-testid="column"]:has(.login-anchor) {
+      background:linear-gradient(180deg,rgba(24,32,47,.98),rgba(14,20,31,.98));
+      border:1px solid #293548; border-radius:22px; padding:30px 32px 24px;
+      box-shadow:0 24px 70px rgba(0,0,0,.42), 0 0 0 1px rgba(255,255,255,.015) inset;
+    }
+    .login-anchor { height:0; margin:0; padding:0; }
+    .login-heading { font-size:25px; font-weight:750; color:#f8fafc; margin:0 0 5px; letter-spacing:-.35px; }
+    .login-hint { color:#8fa0b7; font-size:13px; margin:0 0 22px; }
+    .login-section-label { color:#64748b; font-size:10px; font-weight:800; letter-spacing:1.5px; margin:0 0 8px; }
+    div[data-testid="column"]:has(.login-anchor) div[data-testid="stTextInput"] input {
+      background:#0b1220 !important; border:1px solid #2e3b50 !important;
+      color:#f8fafc !important; -webkit-text-fill-color:#f8fafc !important;
+      border-radius:11px !important; min-height:46px !important; padding:0 14px !important;
+      box-sizing:border-box !important; }
+    div[data-testid="column"]:has(.login-anchor) div[data-testid="stTextInput"] input::placeholder { color:#64748b !important; opacity:1 !important; }
+    div[data-testid="column"]:has(.login-anchor) div[data-testid="stTextInput"] input:focus {
+      border-color:#3b82f6 !important; box-shadow:0 0 0 3px rgba(59,130,246,.14) !important; }
+    div[data-testid="column"]:has(.login-anchor) div[data-testid="stButton"] > button {
+      min-height:46px; height:46px; border-radius:11px; margin-top:7px;
+      font-weight:700; font-size:14px; border:1px solid rgba(96,165,250,.35);
+      box-shadow:0 8px 22px rgba(37,99,235,.20); }
+    .login-security { display:flex; align-items:center; justify-content:center; gap:7px;
+      color:#64748b; font-size:10px; margin-top:18px; padding-top:15px;
+      border-top:1px solid #253043; }
+    .security-dot { color:#22c55e; font-size:8px; }
+    .security-sep { color:#334155; }
+    .small{color:#94a3b8;font-size:13px}.big{font-size:25px;font-weight:700;color:#f8fafc}
+    div[data-testid="stForm"]{border:1px solid #30363d;border-radius:12px;padding:14px;background:#161b22}
+    div[data-testid="stMarkdownContainer"] p, div[data-testid="stMarkdownContainer"] span,
+    div[data-testid="stMarkdownContainer"] label { color:#f8fafc; }
+    div[data-testid="stCaptionContainer"] { color:#94a3b8; }
+    div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input, div[data-testid="stSelectbox"] input { color:#f8fafc; }
+    /* Modern dark sidebar */
+    section[data-testid="stSidebar"] { background:linear-gradient(180deg,#0b1220 0%,#111827 55%,#0f172a 100%); border-right:1px solid #263244; }
+    section[data-testid="stSidebar"] > div { padding:1.1rem .85rem; }
+    section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 { color:#f8fafc; }
+    section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color:#cbd5e1; }
+    section[data-testid="stSidebar"] hr { border-color:#263244; margin:.7rem 0; }
+    /* Sidebar navigation buttons: real Streamlit buttons, equal sizing and centered text */
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        width:100%; min-height:42px; height:42px; margin:0;
+        border-radius:10px; font-weight:600; text-align:center;
+        display:flex; align-items:center; justify-content:center;
+        transition:all .15s ease;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button p {
+        width:100%; text-align:center; margin:0;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+        border-color:#3b82f6; transform:translateY(-1px);
+    }
+    /* Keep the two Level controls exactly equal and centered */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        align-items:center;
+    }
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div {
+        display:flex; align-items:center;
+    }
+    /* Navigation buttons use a compact, uniform gap */
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] > div:has(> div > div[data-testid="stButton"]) {
+        margin-bottom:6px;
+    }
+    /* Ensure selectbox internal dropdown buttons are not expanded or distorted */
+    section[data-testid="stSidebar"] div[data-testid="stSelectbox"] button {
+        width: auto !important;
+        min-height: unset !important;
+        height: auto !important;
+        border: none !important;
+        background: transparent !important;
+        padding: 0 4px !important;
+        box-shadow: none !important;
+        transform: none !important;
+    }
+    /* Selectbox container and input text visible and clearly readable */
+    div[data-testid="stSelectbox"] input {
+        color: #f8fafc !important;
+        -webkit-text-fill-color: #f8fafc !important;
+        font-size: 14px !important;
+        font-weight: 500 !important;
+        opacity: 1 !important;
+    }
+    div[data-testid="stSelectbox"] > div > div {
+        background-color: #111827 !important;
+        border-color: #334155 !important;
+        border-radius: 10px !important;
+        color: #f8fafc !important;
+    }
+    div[data-testid="stSelectbox"] svg {
+        fill: #94a3b8 !important;
+        color: #94a3b8 !important;
+    }
+    div[data-testid="stSelectboxVirtualDropdown"] li,
+    div[data-testid="stSelectboxVirtualDropdown"] [role="option"] {
+        color: #f8fafc !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stNumberInput"] > div {
+        background:#111827; border-color:#334155; border-radius:10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.set_page_config(page_title="MU Injection Manager", page_icon="⚡", layout="wide")
+style()
+con=db()
+# Authentication schema must exist before the login screen queries app_users.
+# This is intentionally kept separate from db() so existing databases are not rebuilt.
+ensure_auth_table(con)
+bootstrap_from_template(con)
+ensure_division_master(con)
+bootstrap_division_template(con)
+
+if not render_login(con):
+    st.stop()
+
+now=datetime.now()
+default_year=now.year
+default_month=now.month
+
+st.markdown("""
+<div class="hero">
+<h1>⚡ MU Injection Manager</h1>
+<p>Meter master + monthly kWh readings + automatic MU report generation</p>
+</div>
+""",unsafe_allow_html=True)
+
+with st.sidebar:
+    auth_user = st.session_state.get("auth_username", "user")
+    st.markdown(f'<div style="color:#94a3b8;font-size:12px;margin-bottom:8px;">Signed in as <b style="color:#f8fafc;">{auth_user}</b></div>', unsafe_allow_html=True)
+    if st.button("↪  Sign out", key="logout_button", use_container_width=True):
+        logout()
+        st.rerun()
+    st.divider()
+    st.markdown("### Period")
+    year=st.number_input("Year",2000,2100,default_year,1)
+    month_options=list(range(1,13))
+    if st.session_state.get("sidebar_month") not in month_options:
+        st.session_state["sidebar_month"] = default_month
+    month=st.selectbox("Month",month_options,
+                       format_func=lambda m:calendar.month_name[m],
+                       key="sidebar_month")
+    st.divider()
+    st.markdown("### View")
+
+    # Use actual Streamlit buttons instead of st.radio so there are no radio dots.
+    # The existing scope/page variables remain unchanged for the rest of the app.
+    if "scope_level" not in st.session_state:
+        st.session_state["scope_level"] = "Circle"
+    if "selected_page" not in st.session_state:
+        st.session_state["selected_page"] = "Enter Readings"
+
+    scope=st.session_state["scope_level"]
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        if st.button("Circle", key="scope_circle", use_container_width=True,
+                      type="primary" if scope=="Circle" else "secondary"):
+            st.session_state["scope_level"] = "Circle"
+            st.rerun()
+    with c2:
+        if st.button("Division", key="scope_division", use_container_width=True,
+                      type="primary" if scope=="Division" else "secondary"):
+            st.session_state["scope_level"] = "Division"
+            st.rerun()
+
+    division_name=None
+    if scope=="Circle":
+        st.caption("Jorhat Circle")
+    else:
+        division_options=list(DIVISIONS.keys())
+        if st.session_state.get("selected_division") not in division_options:
+            st.session_state["selected_division"] = division_options[0]
+        division_name=st.selectbox("Division",division_options,key="selected_division")
+
+    st.divider()
+    st.markdown("### Pages")
+    pages=[
+        "Enter Readings",
+        "Direct MU Entry",
+        "All Feeder Readings",
+        "Feeder Master",
+        "Generate Excel",
+        "Import Excel",
+        "Dashboard"
+    ]
+    for idx, page_name in enumerate(pages):
+        if st.button(page_name, key=f"page_nav_{idx}", use_container_width=True,
+                     type="primary" if st.session_state["selected_page"]==page_name else "secondary"):
+            st.session_state["selected_page"] = page_name
+            st.rerun()
+    page=st.session_state["selected_page"]
+
+# ---------- ENTER READINGS ----------
+if page=="Enter Readings":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Enter Readings — {scope_label} — {calendar.month_name[month]} {year}")
+    st.caption("Monthly readings are shared between circle and division views for the same meter master.")
+    if scope=="Circle":
+            st.subheader(f"Enter Readings — {calendar.month_name[month]} {year}")
+            st.caption("Only feeders without a reading for the selected month are shown. Enter the meter reading in kWh and save each row.")
+
+            types=st.tabs(["Import from GSS","Import from other circle","Export to other circle"])
+
+            for tab,sec in zip(types,["A","B","C"]):
+                with tab:
+                    all_rows=con.execute("""
+                        SELECT f.*,r.id reading_id
+                        FROM feeder_master f
+                        LEFT JOIN monthly_readings r
+                          ON r.feeder_id=f.id AND r.year=? AND r.month=?
+                        WHERE f.active=1 AND f.entry_type=?
+                        ORDER BY f.feeder_name,f.meter_no
+                    """,(year,month,sec)).fetchall()
+
+                    pending=[r for r in all_rows if r["reading_id"] is None]
+                    done=len(all_rows)-len(pending)
+                    st.info(f"{len(pending)} pending · {done} already entered")
+
+                    if not pending:
+                        st.success("All feeders in this section have a reading for this month.")
+                        continue
+
+                    # Exactly 10 feeders per page.
+                    total_pages=(len(pending)+9)//10
+                    key=f"entry_page_{sec}_{year}_{month}"
+                    p=st.number_input("Page",1,total_pages,1,1,key=key)
+                    chunk=pending[(p-1)*10:p*10]
+
+                    for row in chunk:
+                        c1,c2,c3,c4,c5=st.columns([2.8,1.8,1.2,2.0,1.1])
+                        c1.write(f"**{row['feeder_name']}**")
+                        c2.write(row["meter_no"])
+                        c3.write(f"MF: {row['mf']}")
+                        reading=c4.number_input(
+                            "Reading (kWh)",min_value=0.0,value=0.0,format="%.3f",
+                            key=f"new_{sec}_{year}_{month}_{row['id']}"
+                        )
+                        if c5.button("Save",key=f"save_{sec}_{year}_{month}_{row['id']}",type="primary"):
+                            save_reading(con,row["id"],year,month,reading)
+                            st.rerun()
+
+                    st.caption(f"Showing feeders {(p-1)*10+1}–{min(p*10,len(pending))} of {len(pending)} pending.")
+
+
+
+    else:
+        rows=get_scope_rows(con,year,month,"Division",division_name)
+        pending=[r for r in rows if r["reading_id"] is None]
+        done=len(rows)-len(pending)
+        st.info(f"{len(pending)} pending · {done} already entered")
+        if not pending:
+            st.success("All mapped meters in this division have a reading for this month.")
+        else:
+            total_pages=(len(pending)+9)//10
+            pno=st.number_input(
+                "Page",1,total_pages,1,1,
+                key=f"division_entry_page_{division_name}_{year}_{month}"
+            )
+            chunk=pending[(pno-1)*10:pno*10]
+            for row in chunk:
+                c1,c2,c3,c4,c5=st.columns([2.8,1.8,1.2,2.0,1.1])
+                c1.write(f"**{row['feeder_name']}**")
+                c2.write(row["meter_no"])
+                c3.write(f"MF: {row['mf']}")
+                reading=c4.number_input(
+                    "Reading (kWh)",min_value=0.0,value=0.0,format="%.3f",
+                    key=f"dnew_{division_name}_{year}_{month}_{row['id']}"
+                )
+                if c5.button("Save",key=f"dsave_{division_name}_{year}_{month}_{row['id']}",type="primary"):
+                    save_reading(con,row["id"],year,month,reading)
+                    st.rerun()
+            st.caption(f"Showing feeders {(pno-1)*10+1}–{min(pno*10,len(pending))} of {len(pending)} pending.")
+
+# ---------- DIRECT MU ENTRY ----------
+elif page=="Direct MU Entry":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Direct MU Entry — {scope_label} — {calendar.month_name[month]} {year}")
+    st.caption("Search for a specific feeder or meter. Use this only when meter data is lost or the meter is defective.")
+
+    search_text = st.text_input(
+        "Search feeder / meter number",
+        placeholder="Type feeder name or meter number…",
+        key=f"direct_mu_search_{scope}_{division_name}_{year}_{month}"
+    ).strip()
+
+    if not search_text:
+        st.info("Enter a feeder name or meter number above to make a direct MU entry.")
+    else:
+        like=f"%{search_text}%"
+        if scope=="Circle":
+            matches=con.execute("""
+                SELECT f.*, r.id reading_id, r.reading_kwh, r.direct_mu, r.direct_mu_note
+                FROM feeder_master f LEFT JOIN monthly_readings r
+                  ON r.feeder_id=f.id AND r.year=? AND r.month=?
+                WHERE f.active=1 AND (f.feeder_name LIKE ? OR f.meter_no LIKE ?)
+                ORDER BY f.feeder_name,f.meter_no
+            """,(year,month,like,like)).fetchall()
+        else:
+            div_id = get_division_id(con, division_name)
+            if div_id is None:
+                matches = []
+            else:
+                matches = con.execute("""
+                    SELECT DISTINCT f.*, r.id reading_id, r.reading_kwh, r.direct_mu, r.direct_mu_note
+                    FROM feeder_master f
+                    LEFT JOIN division_row_map dm ON dm.feeder_id=f.id AND dm.division_id=? AND dm.active=1
+                    LEFT JOIN monthly_readings r
+                      ON r.feeder_id=f.id AND r.year=? AND r.month=?
+                    WHERE f.active=1 AND (dm.feeder_id IS NOT NULL OR f.division_name=?)
+                      AND (f.feeder_name LIKE ? OR f.meter_no LIKE ?)
+                    ORDER BY f.feeder_name,f.meter_no
+                """,(div_id,year,month,division_name,like,like)).fetchall()
+
+        if not matches:
+            st.warning("No feeder or meter found for the current scope.")
+        else:
+            options=[f"{r['feeder_name']}  |  {r['meter_no']}  |  {r['energy_direction']}" for r in matches]
+            selected=st.selectbox("Select feeder",options,key=f"direct_mu_select_{scope}_{division_name}_{year}_{month}")
+            row=matches[options.index(selected)]
+            st.markdown(f"**{row['feeder_name']}**  ·  Meter: `{row['meter_no']}`  ·  Direction: **{row['energy_direction']}**")
+            current=row['direct_mu'] if row['direct_mu'] is not None else 0.0
+            mu=st.number_input("Direct MU",min_value=0.0,value=float(current),format="%.6f",key=f"direct_mu_value_{scope}_{division_name}_{year}_{month}_{row['id']}")
+            note=st.text_input("Reason / remarks",value=row['direct_mu_note'] or "Meter unavailable/defective",key=f"direct_mu_note_{scope}_{division_name}_{year}_{month}_{row['id']}")
+            if st.button("Save Direct MU",type="primary",key=f"direct_mu_save_{scope}_{division_name}_{year}_{month}_{row['id']}"):
+                con.execute("""INSERT INTO monthly_readings(feeder_id,year,month,reading_kwh,remarks,direct_mu,direct_mu_note)
+                               VALUES(?,?,?,?,?,?,?)
+                               ON CONFLICT(feeder_id,year,month) DO UPDATE SET direct_mu=excluded.direct_mu,direct_mu_note=excluded.direct_mu_note,remarks=excluded.remarks,updated_at=CURRENT_TIMESTAMP""",
+                            (row['id'],year,month,float(row['reading_kwh'] or 0),"Direct MU fallback",float(mu),note))
+                con.commit(); st.success("Direct MU saved."); st.rerun()
+            st.info("Enter MU as a positive magnitude. IMPORT contributes positively; EXPORT is subtracted automatically in division net injection.")
+
+# ---------- ALL FEEDER READINGS ----------
+elif page=="All Feeder Readings":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"All Feeder Readings — {scope_label} — {calendar.month_name[month]} {year}")
+    st.caption("This page includes both entered and pending feeders. Use Edit to correct an existing monthly reading.")
+
+    rows=get_scope_rows(con,year,month,scope,division_name)
+    if not rows:
+        st.info("No feeder master records are mapped to this view yet.")
+    else:
+        for row in rows:
+            prev=get_previous_reading(con,row["id"],year,month)
+            entered=row["reading_id"] is not None
+            with st.container(border=True):
+                c1,c2,c3,c4,c5,c6=st.columns([2.4,1.6,1,1.5,1.5,1])
+                c1.write(f"**{row['feeder_name']}**")
+                c2.write(row["meter_no"])
+                c3.write(TYPE_LABELS[row["entry_type"]])
+                c4.write("—" if prev is None else f"Last: {prev:,.3f}")
+                if entered:
+                    value=c5.number_input("Present kWh",value=float(row["reading_kwh"]),
+                                          format="%.3f",key=f"edit_{row['id']}_{year}_{month}")
+                    if c6.button("Save",key=f"saveedit_{row['id']}_{year}_{month}"):
+                        save_reading(con,row["id"],year,month,value,row["remarks"] or "")
+                        st.rerun()
+                else:
+                    c5.write("**Not entered**")
+                    c6.write("Pending")
+
+# ---------- FEEDER MASTER ----------
+elif page=="Feeder Master":
+    st.subheader("Feeder Master")
+    st.caption("Meter information is stored here permanently. Monthly entry pages only ask for the reading.")
+
+    with st.expander("➕ Add New Feeder",expanded=True):
+        with st.form("new_feeder"):
+            c1,c2,c3=st.columns([2.5,1.8,1])
+            feeder=c1.text_input("Feeder / injection point name")
+            meter=c2.text_input("Meter number")
+            mf=c3.number_input("MF",min_value=0.000001,value=1.0,step=1.0)
+            c4,c5,c6=st.columns([1.5,1.5,1.5])
+            division=c4.selectbox("Division",list(DIVISIONS.keys()),key="new_division")
+            sub_options=[x for x in allowed_subdivisions(division) if x is not None]
+            sub_labels=["None"]+sub_options
+            subdivision_label=c5.selectbox("Subdivision",sub_labels,key="new_subdivision")
+            typ_label=c6.selectbox("Selection",list(TYPE_LABELS.values()),key="new_selection")
+            c7,c8,c9=st.columns([1.3,1.3,2.0])
+            energy_direction=c7.selectbox("Energy Direction",["IMPORT","EXPORT"],index=0 if LABEL_TO_TYPE[typ_label] != "C" else 1,key="new_energy_direction",help="For division reports: IMPORT is added to net injection; EXPORT is subtracted.")
+            voltage=c8.number_input("Voltage (kV)",min_value=0.0,value=33.0,step=1.0)
+            initial=c9.number_input("Initial reading (kWh)",min_value=0.0,value=0.0,format="%.3f",help="Baseline used only when no earlier monthly reading exists. When a historical Excel month is imported, its Last Reading is used automatically as this baseline.")
+            submit=st.form_submit_button("Save new feeder",type="primary",use_container_width=True)
+            if submit:
+                if not feeder.strip() or not meter.strip():
+                    st.error("Feeder name and meter number are required.")
+                else:
+                    try:
+                        add_feeder(con,feeder,meter,mf,LABEL_TO_TYPE[typ_label],initial,division,None if subdivision_label=="None" else subdivision_label,voltage,energy_direction)
+                        st.success("Feeder added.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("This meter number already exists for this selection.")
+
+    st.divider()
+    rows=get_feeders(con,active_only=True)
+
+    for row in rows:
+        with st.expander(f"{row['feeder_name']}  ·  {row['meter_no']}  ·  {row['energy_direction']}  ·  {TYPE_LABELS[row['entry_type']]}  ·  {row['division_name'] or 'No division'} / {row['subdivision'] or 'No subdivision'}"):
+            with st.form(f"editmaster_{row['id']}"):
+                c1,c2,c3=st.columns([2.5,1.8,1])
+                feeder=c1.text_input("Feeder name",value=row["feeder_name"],key=f"fn_{row['id']}")
+                meter=c2.text_input("Meter number",value=row["meter_no"],key=f"mn_{row['id']}")
+                mf=c3.number_input("MF",min_value=0.000001,value=float(row["mf"]),key=f"mf_{row['id']}")
+                c4,c5,c6=st.columns([1.5,1.5,1.5])
+                division_index=list(DIVISIONS.keys()).index(row["division_name"]) if row["division_name"] in DIVISIONS else 0
+                division=c4.selectbox("Division",list(DIVISIONS.keys()),index=division_index,key=f"dv_{row['id']}")
+                sub_options=[x for x in allowed_subdivisions(division) if x is not None]
+                sub_labels=["None"]+sub_options
+                current_sub=row["subdivision"] if row["subdivision"] in sub_options else "None"
+                subdivision_label=c5.selectbox("Subdivision",sub_labels,index=sub_labels.index(current_sub),key=f"sd_{row['id']}")
+                typ=c6.selectbox("Selection",list(TYPE_LABELS.values()),
+                                 index=list(TYPE_LABELS).index(row["entry_type"]),
+                                 key=f"tp_{row['id']}")
+                c7,c8=st.columns([1.3,1.3])
+                energy_direction=c7.selectbox("Energy Direction",["IMPORT","EXPORT"],index=0 if row["energy_direction"]!="EXPORT" else 1,key=f"ed_{row['id']}",help="For division reports: IMPORT is added to net injection; EXPORT is subtracted.")
+                voltage=c8.number_input("Voltage (kV)",min_value=0.0,value=float(row["voltage_kv"] or 33),step=1.0,key=f"vg_{row['id']}")
+                c9=st.container()
+                initial=c9.number_input("Initial reading (kWh)",min_value=0.0,
+                                        value=float(row["initial_reading_kwh"]),
+                                        key=f"ir_{row['id']}",format="%.3f",
+                                        help="Baseline used only when no earlier monthly reading exists. Historical Excel imports can update this automatically from the workbook's Last Reading.")
+                save,delete=st.columns(2)
+                if save.form_submit_button("Save changes",type="primary",use_container_width=True):
+                    try:
+                        update_feeder(con,row["id"],feeder,meter,mf,LABEL_TO_TYPE[typ],initial,division,None if subdivision_label=="None" else subdivision_label,voltage,energy_direction)
+                        st.success("Feeder updated.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("This meter number already exists for that selection.")
+                if delete.form_submit_button("Delete feeder",use_container_width=True):
+                    delete_feeder(con,row["id"])
+                    st.success("Feeder deleted.")
+                    st.rerun()
+
+# ---------- EXCEL ----------
+elif page=="Generate Excel":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Generate Excel — {scope_label} — {calendar.month_name[month]} {year}")
+    rows=get_scope_rows(con,year,month,scope,division_name)
+    entered=[r for r in rows if r["reading_id"] is not None]
+    pending=[r for r in rows if r["reading_id"] is None]
+
+    c1,c2,c3=st.columns(3)
+    c1.metric("Total feeders",len(rows))
+    c2.metric("Readings entered",len(entered))
+    c3.metric("Pending",len(pending))
+
+    if pending:
+        st.warning("Some mapped feeders do not have a reading for this month. The generated workbook will show those readings as blank.")
+
+    if st.button("Build exact Excel workbook",type="primary",use_container_width=True):
+        if scope=="Circle":
+            data=build_report(con,year,month)
+            filename=f"MU Inj. {calendar.month_name[month]}, {year}.xlsx"
+        else:
+            data=division_report(con,year,month,division_name)
+            filename=f"MU Inj ({division_name}) {calendar.month_name[month]}, {year}.xlsx"
+        st.download_button(
+            "⬇ Download Excel",data=data,file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+        st.success("Report generated from the supplied Excel template.")
+
+# ---------- IMPORT EXCEL ----------
+elif page=="Import Excel":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Import Monthly Excel — {scope_label}")
+    if scope=="Circle":
+        st.caption("Upload the monthly Jorhat Circle workbook. Meter masters and monthly readings are stored in the shared database.")
+    else:
+        st.caption("Upload the all-division workbook once. All available Jorhat-1, Jorhat-2 and Teok sheets are processed; the selected division only controls the current view.")
+
+    c1,c2=st.columns(2)
+    import_year=c1.number_input("Excel month — Year",2000,2100,year,1,key="import_year")
+    import_month=c2.selectbox(
+        "Excel month — Month",range(1,13),index=month-1,
+        format_func=lambda m:calendar.month_name[m],key="import_month"
+    )
+    uploaded=st.file_uploader(
+        "Upload monthly Excel file",type=["xlsx","xlsm"],key="monthly_excel_upload"
+    )
+    overwrite=st.checkbox(
+        "Overwrite readings already stored for this month",value=False,
+        help="Leave unchecked to protect existing database readings."
+    )
+
+    if scope=="Circle":
+        st.info("Importing a circle workbook makes the meter readings immediately available in the mapped divisions. You do not need to upload the same meter data again in a division.")
+    else:
+        st.info("All available division sheets are mapped to the shared meter masters. If a meter reading was already imported at circle level, the existing monthly reading is retained.")
+
+    if uploaded is not None:
+        st.write(f"**Selected:** {uploaded.name}")
+        if st.button("Import this month into database",type="primary",use_container_width=True):
+            try:
+                if scope=="Circle":
+                    result=import_month_excel(
+                        con,uploaded.getvalue(),int(import_year),int(import_month),overwrite
+                    )
+                    st.success(
+                        f"Imported {result['imported']} monthly readings. "
+                        f"Added {result['new_master']} new feeder records. "
+                        f"Updated {result['updated_master']} existing feeder records. "
+                        f"Overwritten {result['overwritten']} existing monthly readings."
+                    )
+                else:
+                    result=import_all_division_workbook(
+                        con,uploaded.getvalue(),int(import_year),int(import_month),overwrite
+                    )
+                    st.success(
+                        f"Processed {result['divisions']} division sheets. "
+                        f"Mapped {result['mapped']} division rows. "
+                        f"Imported {result['imported']} new monthly readings. "
+                        f"Reused/protected {result['reused']} existing readings. "
+                        f"Added {result['new_master']} new meter masters."
+                    )
+                if result["skipped"]:
+                    st.warning(f"{len(result['skipped'])} rows were skipped.")
+                    with st.expander("View skipped rows"):
+                        for item in result["skipped"]:
+                            st.write(f"• {item}")
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+
+    st.divider()
+    st.markdown("**Shared-data workflow**")
+    st.markdown(
+        "Import a Jorhat Circle workbook once. Then switch **Level → Division** "
+        "and select Jorhat-1, Jorhat-2 or Teok. Mapped meters use the same stored "
+        "monthly reading, so a second upload is not required."
+    )
+
+# ---------- DASHBOARD ----------
+else:
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Dashboard — {scope_label} — {calendar.month_name[month]} {year}")
+
+    if scope=="Circle":
+        rows=get_scope_rows(con,year,month,"Circle",None)
+        totals={"A":0.0,"B":0.0,"C":0.0}
+        counts={"A":0,"B":0,"C":0}
+        for r in rows:
+            if r["reading_id"] is not None:
+                counts[r["entry_type"]]+=1
+                mu=calculate_mu(con,r,year,month)
+                if mu is not None:
+                    totals[r["entry_type"]]+=mu
+        net=totals["A"]+totals["B"]-totals["C"]
+
+        cols=st.columns(4)
+        cols[0].metric("A — GSS",f"{totals['A']:,.6f} MU")
+        cols[1].metric("B — Other circle",f"{totals['B']:,.6f} MU")
+        cols[2].metric("C — Export",f"{totals['C']:,.6f} MU")
+        cols[3].metric("Net injection",f"{net:,.6f} MU")
+
+        st.dataframe({
+            "Section":["A — Import from GSS","B — Import from other circle","C — Export to other circle","NET"],
+            "Readings entered":[counts["A"],counts["B"],counts["C"],sum(counts.values())],
+            "Energy (MU)":[totals["A"],totals["B"],totals["C"],net]
+        },use_container_width=True,hide_index=True)
+
+        st.divider()
+        st.subheader("Energy Trend — Last 5 Months")
+        trend=[]
+        y,m=year,month
+        for _ in range(5):
+            t=month_energy_summary(con,y,m)
+            trend.append({
+                "Month":f"{calendar.month_abbr[m]} {y}",
+                "A — GSS":t["A"],
+                "B — Other circle":t["B"],
+                "C — Export":t["C"],
+                "Net injection":t["NET"],
+            })
+            y,m=previous_period(y,m)
+        trend.reverse()
+        trend_df=pd.DataFrame(trend).set_index("Month")
+        st.line_chart(trend_df,use_container_width=True)
+        st.dataframe(trend_df.reset_index(),use_container_width=True,hide_index=True)
+
+    else:
+        totals=division_energy_summary(con,year,month,division_name)
+        rows=get_scope_rows(con,year,month,"Division",division_name)
+        entered=sum(1 for r in rows if r["reading_id"] is not None)
+
+        cols=st.columns(4)
+        cols[0].metric("Import",f"{totals['IMPORT']:,.3f} MWh")
+        cols[1].metric("Export",f"{totals['EXPORT']:,.3f} MWh")
+        cols[2].metric("Net injection",f"{totals['NET']:,.3f} MWh")
+        cols[3].metric("Meters entered",entered)
+
+        st.dataframe({
+            "Flow":["Import","Export","NET"],
+            "Energy (MWh)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]
+        },use_container_width=True,hide_index=True)
+
+        st.divider()
+        st.subheader("Energy Trend — Last 5 Months")
+        trend=[]
+        y,m=year,month
+        for _ in range(5):
+            t=division_energy_summary(con,y,m,division_name)
+            trend.append({
+                "Month":f"{calendar.month_abbr[m]} {y}",
+                "Import (MWh)":t["IMPORT"],
+                "Export (MWh)":t["EXPORT"],
+                "Net injection (MWh)":t["NET"],
+            })
+            y,m=previous_period(y,m)
+        trend.reverse()
+        trend_df=pd.DataFrame(trend).set_index("Month")
+        st.line_chart(trend_df,use_container_width=True)
+        st.dataframe(trend_df.reset_index(),use_container_width=True,hide_index=True)
+
