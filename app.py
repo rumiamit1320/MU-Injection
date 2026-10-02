@@ -1557,12 +1557,10 @@ with st.sidebar:
         if st.button("Circle", key="scope_circle", use_container_width=True,
                       type="primary" if scope=="Circle" else "secondary"):
             st.session_state["scope_level"] = "Circle"
-            st.rerun()
     with c2:
         if st.button("Division", key="scope_division", use_container_width=True,
                       type="primary" if scope=="Division" else "secondary"):
             st.session_state["scope_level"] = "Division"
-            st.rerun()
 
     division_name=None
     if scope=="Circle":
@@ -1588,7 +1586,6 @@ with st.sidebar:
         if st.button(page_name, key=f"page_nav_{idx}", use_container_width=True,
                      type="primary" if st.session_state["selected_page"]==page_name else "secondary"):
             st.session_state["selected_page"] = page_name
-            st.rerun()
     page=st.session_state["selected_page"]
 
 # ---------- ENTER READINGS ----------
