@@ -62,3 +62,38 @@ The application now requires authentication before the main interface is loaded.
 - Passwords are stored as salted PBKDF2-SHA256 hashes in the local SQLite database; the plaintext password is not stored.
 
 For a production deployment, replace the default password and use an appropriate external identity provider or secrets-management system.
+
+
+## Production database: Vercel + Neon
+
+The application supports PostgreSQL through the `DATABASE_URL` environment variable. When `DATABASE_URL` is present, the application uses PostgreSQL/Neon; when it is absent, local development continues to use SQLite.
+
+Recommended deployment architecture:
+
+- Streamlit application: Render
+- Database: Neon PostgreSQL provisioned through the Vercel Marketplace
+- Database connection: Render environment variable `DATABASE_URL`
+- Excel templates remain in the GitHub repository
+- Do not commit `mu_injection.db` or other SQLite/database files
+
+### Neon setup
+
+1. In Vercel, open Marketplace → Neon and create a Neon Postgres resource.
+2. Create/connect the database to a Vercel project as required by the Vercel/Neon integration.
+3. Copy the PostgreSQL connection string from Neon.
+4. In the Render service, add it as the secret environment variable `DATABASE_URL`.
+5. Also set `MU_ADMIN_USERNAME` and `MU_ADMIN_PASSWORD` in Render before the first production login.
+
+Neon provides a standard PostgreSQL connection URI, and the application automatically requires TLS when the URI does not already specify an `sslmode` parameter.
+
+### Render start command
+
+```
+streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+```
+
+The included `render.yaml` contains the same configuration.
+
+### Existing SQLite data
+
+The PostgreSQL backend creates the same application tables automatically. Existing local SQLite data is not copied automatically. If historical data from an existing `mu_injection.db` must be preserved, migrate it into Neon before production use rather than committing the SQLite database to GitHub.
