@@ -311,6 +311,10 @@ def db():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
         return PostgresConnection(database_url)
+    if os.getenv("RENDER") == "true":
+        raise RuntimeError(
+            "DATABASE_URL is not configured. This Render deployment requires the Neon PostgreSQL connection string."
+        )
     return db_sqlite()
 
 
