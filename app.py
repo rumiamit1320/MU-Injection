@@ -1506,11 +1506,14 @@ ensure_auth_table(con)
 if not render_login(con):
     st.stop()
 
-# Perform data/template bootstrapping only after authentication so the
-# login screen is not blocked by first-run database/template initialization.
-bootstrap_from_template(con)
-ensure_division_master(con)
-bootstrap_division_template(con)
+# Perform data/template bootstrapping only once per authenticated
+# Streamlit session so page navigation does not repeat the expensive
+# first-run database/template initialization.
+if not st.session_state.get("_data_bootstrapped", False):
+    bootstrap_from_template(con)
+    ensure_division_master(con)
+    bootstrap_division_template(con)
+    st.session_state["_data_bootstrapped"] = True
 
 now=datetime.now()
 default_year=now.year
