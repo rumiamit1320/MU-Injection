@@ -1502,12 +1502,15 @@ con=db()
 # Authentication schema must exist before the login screen queries app_users.
 # This is intentionally kept separate from db() so existing databases are not rebuilt.
 ensure_auth_table(con)
-bootstrap_from_template(con)
-ensure_division_master(con)
-bootstrap_division_template(con)
 
 if not render_login(con):
     st.stop()
+
+# Perform data/template bootstrapping only after authentication so the
+# login screen is not blocked by first-run database/template initialization.
+bootstrap_from_template(con)
+ensure_division_master(con)
+bootstrap_division_template(con)
 
 now=datetime.now()
 default_year=now.year
