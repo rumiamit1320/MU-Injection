@@ -1544,23 +1544,30 @@ with st.sidebar:
     st.divider()
     st.markdown("### View")
 
-    # Use actual Streamlit buttons instead of st.radio so there are no radio dots.
-    # The existing scope/page variables remain unchanged for the rest of the app.
+    # Keep navigation in session state, but use button callbacks so the
+    # selected value is written before Streamlit reruns the script.
+    # This prevents page/scope clicks from being applied one rerun late.
     if "scope_level" not in st.session_state:
         st.session_state["scope_level"] = "Circle"
     if "selected_page" not in st.session_state:
         st.session_state["selected_page"] = "Enter Readings"
 
+    def _set_nav_state(value):
+        st.session_state["selected_page"] = value
+
+    def _set_scope_state(value):
+        st.session_state["scope_level"] = value
+
     scope=st.session_state["scope_level"]
     c1, c2 = st.columns(2, gap="small")
     with c1:
-        if st.button("Circle", key="scope_circle", use_container_width=True,
-                      type="primary" if scope=="Circle" else "secondary"):
-            st.session_state["scope_level"] = "Circle"
+        st.button("Circle", key="scope_circle", use_container_width=True,
+                  type="primary" if scope=="Circle" else "secondary",
+                  on_click=_set_scope_state, args=("Circle",))
     with c2:
-        if st.button("Division", key="scope_division", use_container_width=True,
-                      type="primary" if scope=="Division" else "secondary"):
-            st.session_state["scope_level"] = "Division"
+        st.button("Division", key="scope_division", use_container_width=True,
+                  type="primary" if scope=="Division" else "secondary",
+                  on_click=_set_scope_state, args=("Division",))
 
     division_name=None
     if scope=="Circle":
@@ -1583,9 +1590,9 @@ with st.sidebar:
         "Dashboard"
     ]
     for idx, page_name in enumerate(pages):
-        if st.button(page_name, key=f"page_nav_{idx}", use_container_width=True,
-                     type="primary" if st.session_state["selected_page"]==page_name else "secondary"):
-            st.session_state["selected_page"] = page_name
+        st.button(page_name, key=f"page_nav_{idx}", use_container_width=True,
+                  type="primary" if st.session_state["selected_page"]==page_name else "secondary",
+                  on_click=_set_nav_state, args=(page_name,))
     page=st.session_state["selected_page"]
 
 # ---------- ENTER READINGS ----------
