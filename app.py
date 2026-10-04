@@ -1263,8 +1263,16 @@ def get_report_reading_rows(con, year, month):
     """, (year, month)).fetchall()
     return rows
 
+def _is_mu_template_pending(row):
+    return (
+        row["reading_id"] is not None
+        and row["direct_mu"] is None
+        and float(row["reading_kwh"] or 0) == 0.0
+        and str(row["remarks"] or "").startswith("Added from MU Template")
+    )
+
 def calculate_mu(con, row, year, month):
-    if row["reading_id"] is None:
+    if row["reading_id"] is None or _is_mu_template_pending(row):
         return None
     # A direct MU entry is a month-specific fallback for lost/defective meters.
     # It is stored as a positive magnitude; report logic applies Import/Export sign.
@@ -1593,9 +1601,9 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section):
                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 feeder_id, year, month, 0.0,
-                "Added from MU Template",
+                "Added from MU Template — pending reading",
                 section, next_order,
-                row["feeder_name"], row["meter_no"], float(row["mf"]), None
+                row["feeder_name"], row["meter_no"], float(row["mf"]), next_order
             )
         )
     else:
@@ -1606,11 +1614,12 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section):
                    report_feeder_name=?,
                    report_meter_no=?,
                    report_mf=?,
+                   report_sl_no=?,
                    updated_at=CURRENT_TIMESTAMP
                WHERE id=?""",
             (
                 section, next_order,
-                row["feeder_name"], row["meter_no"], float(row["mf"]),
+                row["feeder_name"], row["meter_no"], float(row["mf"]), next_order,
                 existing["id"]
             )
         )
@@ -1658,6 +1667,8 @@ def build_report(con, year, month):
 
         serial=0
         for row in rows:
+            if _is_mu_template_pending(row):
+                continue
             present=row["reading_kwh"]
             direct_mu=row["direct_mu"]
             source_last=row["last_reading_kwh"]
@@ -2011,7 +2022,7 @@ if page=="Enter Readings":
                         ORDER BY f.feeder_name,f.meter_no
                     """,(year,month,sec)).fetchall()
 
-                    pending=[r for r in all_rows if r["reading_id"] is None]
+                    pending=[r for r in all_rows if r["reading_id"] is None or _is_mu_template_pending(r)]
                     done=len(all_rows)-len(pending)
                     st.info(f"{len(pending)} pending · {done} already entered")
 
@@ -2044,7 +2055,7 @@ if page=="Enter Readings":
 
     else:
         rows=get_scope_rows(con,year,month,"Division",division_name)
-        pending=[r for r in rows if r["reading_id"] is None]
+        pending=[r for r in rows if r["reading_id"] is None or _is_mu_template_pending(r)]
         done=len(rows)-len(pending)
         st.info(f"{len(pending)} pending · {done} already entered")
         if not pending:
@@ -2140,7 +2151,7 @@ elif page=="All Feeder Readings":
     else:
         for row in rows:
             prev=get_previous_reading(con,row["id"],year,month)
-            entered=row["reading_id"] is not None
+            entered=row["reading_id"] is not None and not _is_mu_template_pending(row)
             with st.container(border=True):
                 c1,c2,c3,c4,c5,c6=st.columns([2.4,1.6,1,1.5,1.5,1])
                 c1.write(f"**{row['feeder_name']}**")
