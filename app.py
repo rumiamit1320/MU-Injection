@@ -1148,12 +1148,16 @@ def _find_section_rows(ws, sec):
 
 
 def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
-    """Import one monthly MU workbook using only meter readings and MF.
+    """Import one monthly MU workbook using meter readings/MF plus
+    historical Direct MU exceptions.
 
     The workbook's Last Reading is used as the feeder's initial baseline when
     the database has no monthly reading before the imported month. This makes
     a historical import such as January 2026 self-contained: January Present
     becomes the stored January reading and January Last becomes its baseline.
+    When column H contains a non-formula/manual MU value that does not match
+    Present-Last times MF, it is preserved as the month-specific Direct MU
+    fallback so historical reports remain faithful to the source workbook.
     """
     wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
     wb_values = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=True)
@@ -1244,8 +1248,8 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                     skipped.append(f"{sec}: {feeder} / {meter} — monthly reading already exists")
                     continue
 
-                # MU is deliberately NOT imported from the workbook. It is
-                # always calculated by the application from Present-Last and MF.
+                # Normal rows are recalculated from Present-Last and MF.
+                # A detected historical exception is stored as Direct MU above.
                 con.execute("""
                     INSERT INTO monthly_readings
                     (feeder_id,year,month,reading_kwh,remarks,direct_mu,direct_mu_note)
