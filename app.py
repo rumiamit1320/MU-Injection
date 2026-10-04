@@ -1506,6 +1506,53 @@ def copy_row(ws, src_row, dst_row):
     for c in range(1, ws.max_column+1):
         copy_style(ws.cell(src_row,c), ws.cell(dst_row,c))
 
+def _report_rows_with_meter_continuity(con, year, month, sec):
+    rows = list(con.execute("""
+        SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks,
+               r.report_feeder_name, r.report_meter_no, r.report_mf, r.report_sl_no,
+               r.report_order
+        FROM monthly_readings r
+        JOIN feeder_master f ON f.id=r.feeder_id
+        WHERE r.year=? AND r.month=? AND r.report_section=?
+        ORDER BY r.report_order, r.id
+    """, (year, month, sec)).fetchall())
+
+    changes = con.execute(
+        """SELECT h.*, f.feeder_name AS current_feeder_name,
+                  f.meter_no AS current_meter_no, f.mf AS current_mf
+           FROM meter_change_history h
+           JOIN feeder_master f ON f.id=h.feeder_id
+           WHERE h.year=? AND h.month=? AND h.old_entry_type=?
+           ORDER BY h.id""",
+        (year, month, sec)
+    ).fetchall()
+
+    # Show the previous meter/MF once, only in the month of the change.
+    # The continuity row has zero MU so it does not alter report totals.
+    for ch in changes:
+        current = next((x for x in rows if x["id"] == ch["feeder_id"]), None)
+        if current is None:
+            continue
+        item = dict(current)
+        item["id"] = -int(ch["id"])
+        item["reading_kwh"] = ch["old_last_reading_kwh"]
+        item["last_reading_kwh"] = ch["old_last_reading_kwh"]
+        item["direct_mu"] = 0.0
+        item["remarks"] = "Previous meter/MF — continuity record"
+        item["report_meter_no"] = ch["old_meter_no"]
+        item["report_mf"] = ch["old_mf"]
+        item["report_sl_no"] = None
+        item["report_order"] = (current["report_order"] or 0) - 0.1
+        item["report_feeder_name"] = ch["old_feeder_name"] or current["report_feeder_name"]
+        rows.append(item)
+
+    rows.sort(key=lambda x: (
+        x["report_order"] if x["report_order"] is not None else 10**9,
+        x["id"]
+    ))
+    return rows
+
+
 def build_report(con, year, month):
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb["MU inj JEC"]
@@ -1519,15 +1566,7 @@ def build_report(con, year, month):
     }
 
     for sec in ["A","B","C"]:
-        rows = con.execute("""
-            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks,
-                   r.report_feeder_name, r.report_meter_no, r.report_mf, r.report_sl_no
-            FROM monthly_readings r
-            JOIN feeder_master f ON f.id=r.feeder_id
-            WHERE r.year=? AND r.month=?
-              AND r.report_section=?
-            ORDER BY r.report_order, r.id
-        """, (year,month,sec)).fetchall()
+        rows = _report_rows_with_meter_continuity(con, year, month, sec)
 
         start_row,end_row,subtotal=sections[sec]
         capacity=end_row-start_row+1
@@ -1551,21 +1590,16 @@ def build_report(con, year, month):
             for c in range(1,10):
                 ws.cell(r,c).value=None
 
-        rows=con.execute("""
-            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks,
-                   r.report_feeder_name, r.report_meter_no, r.report_mf, r.report_sl_no
-            FROM monthly_readings r
-            JOIN feeder_master f ON f.id=r.feeder_id
-            WHERE r.year=? AND r.month=?
-              AND r.report_section=?
-            ORDER BY r.report_order, r.id
-        """,(year,month,sec)).fetchall()
+        rows=_report_rows_with_meter_continuity(con,year,month,sec)
 
         serial=0
         for row in rows:
             present=row["reading_kwh"]
             direct_mu=row["direct_mu"]
             source_last=row["last_reading_kwh"]
+            change = get_meter_change(con, row["id"], year, month)
+            if change is not None and row["meter_no"] == change["new_meter_no"] and change["old_meter_no"] != change["new_meter_no"]:
+                source_last = float(row["initial_reading_kwh"])
             if source_last is None and present is not None and direct_mu is None:
                 source_last=get_previous_reading(con,row["id"],year,month)
 
