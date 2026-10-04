@@ -840,32 +840,32 @@ def get_scope_rows(con, year, month, scope, division_name=None):
     ).fetchall()
 
 
-def division_energy_summary(con, year, month, division_name):
-    div_id = get_division_id(con, division_name)
-    totals = {"IMPORT": 0.0, "EXPORT": 0.0}
+def division_energy_summary(con,year,month,division_name):
+    div_id=get_division_id(con,division_name)
+    totals={"IMPORT":0.0,"EXPORT":0.0}
     if div_id is None:
-        totals["NET"] = 0.0; return totals
-    maps = con.execute(
-        """SELECT m.*, f.mf, r.reading_kwh AS master_reading, r.direct_mu AS master_direct_mu, dr.reading_kwh AS row_reading
-           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
-           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
-           LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
-           WHERE m.division_id=? AND m.active=1""",
-        (year, month, year, month, div_id)).fetchall()
+        totals["NET"]=0.0
+        return totals
+    maps=con.execute("""SELECT m.*,f.mf,r.reading_kwh AS master_reading,r.direct_mu AS master_direct_mu,
+                               dr.reading_kwh AS row_reading
+                        FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+                        LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
+                        LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+                        WHERE m.division_id=? AND m.active=1
+                        ORDER BY m.sheet_row,m.id""",
+                     (year,month,year,month,div_id)).fetchall()
     for row in maps:
+        present=row["row_reading"] if row["row_reading"] is not None else row["master_reading"]
+        if present is None: continue
         if row["master_direct_mu"] is not None:
-            energy_mwh=float(row["master_direct_mu"])*1000.0
+            mu=abs(float(row["master_direct_mu"]))
         else:
-            present = row["row_reading"] if row["row_reading"] is not None else row["master_reading"]
-            if present is None: continue
-            prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (row["feeder_id"],year,year,month)).fetchone()
-            prev = float(row["baseline_reading_kwh"]) if prior is None and row["baseline_reading_kwh"] is not None else get_previous_reading(con,row["feeder_id"],year,month)
+            prev=get_previous_division_reading(con,row["id"],row["feeder_id"],year,month,row["baseline_reading_kwh"])
             if prev is None: continue
-            energy_mwh=(float(present)-prev)*float(row["mf"])
-        totals[row["flow_direction"]]+=energy_mwh
+            mu=abs((float(present)-float(prev))*float(row["mf"])/1000.0)
+        totals["EXPORT" if row["flow_direction"]=="EXPORT" else "IMPORT"]+=mu
     totals["NET"]=totals["IMPORT"]-totals["EXPORT"]
     return totals
-
 
 def insert_rows_preserve_merges(ws, idx, amount, copy_from):
     ranges=[]
@@ -883,164 +883,147 @@ def insert_rows_preserve_merges(ws, idx, amount, copy_from):
             max_row += amount
         ws.merge_cells(start_row=min_row,start_column=min_col,end_row=max_row,end_column=max_col)
 
-def division_report(con, year, month, division_name):
-    template = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
-    wb = openpyxl.load_workbook(template)
-    sheet_name = DIVISIONS[division_name]
-    ws = wb[sheet_name]
-    div_id = get_division_id(con, division_name)
+def division_report(con,year,month,division_name):
+    """Generate division workbook in the supplied division format.
+    Circle generation is intentionally not touched.
+    """
+    template=APP_DIR/"MU_Injection_All_Divisions_Template.xlsx"
+    wb=openpyxl.load_workbook(template)
+    sheet_name=DIVISIONS[division_name]
+    ws=wb[sheet_name]
+    div_id=get_division_id(con,division_name)
+    next_month=1 if month==12 else month+1
+    next_year=year+1 if month==12 else year
+    ws["A2"]=f"For the month of {calendar.month_name[month]}, {year} (Billed in {calendar.month_name[next_month]} , {next_year})"
 
-    next_month = 1 if month == 12 else month + 1
-    next_year = year + 1 if month == 12 else year
-    ws["A2"] = (f"For the month of {calendar.month_name[month]}, {year} "
-                f"(Billed in {calendar.month_name[next_month]} , {next_year})")
-
-    sections = {
-        "Jorhat-ONE": [(None, 4, 29, 31)],
-        "Jorhat-TWO": [("Titabar", 5, 10, 11), ("Mariani", 13, 21, 22), ("Majuli", 24, 26, 27)],
-        "Teok^": [("Teok", 5, 19, 20), ("Kakojan", 22, 29, 30)],
+    sections={
+        "Jorhat-ONE":[(None,4,29,31)],
+        "Jorhat-TWO":[("Titabar",5,10,11),("Mariani",13,21,22),("Majuli",24,26,27)],
+        "Teok^":[("Teok",5,19,20),("Kakojan",22,29,30)]
     }[sheet_name]
 
-    negative_maps = con.execute(
-        """SELECT m.*, f.feeder_name, f.meter_no, f.mf, f.voltage_kv, r.reading_kwh
-           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
-           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
-           WHERE m.division_id=? AND m.active=1 AND m.sheet_row < 0
-           ORDER BY m.sub_division, f.feeder_name, f.meter_no""",
-        (year, month, div_id)).fetchall()
+    negative_maps=con.execute("""SELECT m.*,f.feeder_name,f.meter_no,f.mf,f.voltage_kv
+                                 FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+                                 WHERE m.division_id=? AND m.active=1 AND m.sheet_row<0
+                                 ORDER BY m.sub_division,m.id""",(div_id,)).fetchall()
+    insertion_by_sub={}
+    for sub,start_row,end_row,total_row in sections:
+        insertion_by_sub[sub]=sum(1 for x in negative_maps if (x["sub_division"] or None)==sub)
+    for sub,start_row,end_row,total_row in reversed(sections):
+        count=insertion_by_sub[sub]
+        if count: insert_rows_preserve_merges(ws,total_row,count,start_row)
 
-    insertion_by_sub = {}
-    for sub, start_row, end_row, total_row in sections:
-        insertion_by_sub[sub] = sum(1 for x in negative_maps if (x["sub_division"] or None) == sub)
+    shift=0
+    live_sections=[]
+    for sub,start_row,end_row,total_row in sections:
+        start_row+=shift; end_row+=shift; total_row+=shift
+        count=insertion_by_sub[sub]
+        end_row+=count; total_row+=count
+        live_sections.append((sub,start_row,end_row,total_row))
+        shift+=count
 
-    for sub, start_row, end_row, total_row in reversed(sections):
-        count = insertion_by_sub[sub]
-        if count:
-            copy_from = start_row
-            insert_rows_preserve_merges(ws, total_row, count, copy_from)
+    for sub,start_row,end_row,total_row in live_sections:
+        for rr in range(start_row,end_row+1):
+            for col in range(6,13): ws.cell(rr,col).value=None
 
-    shift = 0
-    live_sections = []
-    for sub, start_row, end_row, total_row in sections:
-        start_row += shift; end_row += shift; total_row += shift
-        count = insertion_by_sub[sub]
-        end_row += count; total_row += count
-        live_sections.append((sub, start_row, end_row, total_row))
-        shift += count
+    maps=con.execute("""SELECT m.id AS map_id,m.sheet_row,m.sub_division,m.flow_direction,m.feeder_id,
+                               m.baseline_reading_kwh,m.source_feeder_name,m.source_meter_no,
+                               f.feeder_name,f.meter_no,f.mf,f.voltage_kv,
+                               r.reading_kwh AS master_reading,r.direct_mu AS master_direct_mu,
+                               dr.reading_kwh AS row_reading
+                        FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+                        LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
+                        LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+                        WHERE m.division_id=? AND m.active=1
+                        ORDER BY m.sheet_row,m.id""",
+                     (year,month,year,month,div_id)).fetchall()
 
-    for sub, start_row, end_row, total_row in live_sections:
-        for r in range(start_row, end_row + 1):
-            for c in range(6, 13):
-                ws.cell(r, c).value = None
-
-    maps = con.execute(
-        """SELECT m.sheet_row, m.sub_division, m.flow_direction, m.feeder_id,
-                  m.baseline_reading_kwh, f.feeder_name, f.meter_no, f.mf,
-                  f.voltage_kv, r.reading_kwh AS master_reading, r.direct_mu AS master_direct_mu, dr.reading_kwh AS row_reading
-           FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
-           LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
-           LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
-           WHERE m.division_id=? AND m.active=1
-           ORDER BY m.sheet_row, m.flow_direction""",
-        (year, month, year, month, div_id)).fetchall()
-
-    used_rows = {x["sheet_row"] for x in maps if x["sheet_row"] > 0}
-    allocated = []
-    for sub, start_row, end_row, total_row in live_sections:
-        new_items = [x for x in maps if x["sheet_row"] < 0 and (x["sub_division"] or None) == sub]
-        free = [r for r in range(end_row - len(new_items) + 1, end_row + 1) if r not in used_rows]
-        for item, rr in zip(new_items, free):
-            allocated.append((rr, item)); used_rows.add(rr)
-
-    rows_by_row = {}
+    used_rows={x["sheet_row"] for x in maps if x["sheet_row"]>0}
+    allocated=[]
+    for sub,start_row,end_row,total_row in live_sections:
+        new_items=[x for x in maps if x["sheet_row"]<0 and (x["sub_division"] or None)==sub]
+        free=[rr for rr in range(end_row-len(new_items)+1,end_row+1) if rr not in used_rows]
+        for item,rr in zip(new_items,free):
+            allocated.append((rr,item)); used_rows.add(rr)
+    rows_by_row={}
     for row in maps:
-        if row["sheet_row"] > 0:
-            rows_by_row.setdefault(row["sheet_row"], []).append(row)
-    for rr, item in allocated:
-        rows_by_row.setdefault(rr, []).append(item)
+        if row["sheet_row"]>0: rows_by_row.setdefault(row["sheet_row"],[]).append(row)
+    for rr,item in allocated: rows_by_row.setdefault(rr,[]).append(item)
 
-    for r, rowmaps in sorted(rows_by_row.items()):
-        base = rowmaps[0]
-        present = base["row_reading"] if base["row_reading"] is not None else base["master_reading"]
-        direct_mu = base["master_direct_mu"]
-        flows = {x["flow_direction"] for x in rowmaps}
+    # Reference convention: Jorhat-ONE uses KWh in I:K; other two sheets use MWh.
+    multiplier=1000 if sheet_name=="Jorhat-ONE" else 1
+    divisor=1000000 if sheet_name=="Jorhat-ONE" else 1000
+
+    for rr,rowmaps in sorted(rows_by_row.items()):
+        base=rowmaps[0]
+        present=base["row_reading"] if base["row_reading"] is not None else base["master_reading"]
+        flows={x["flow_direction"] for x in rowmaps}
+        if not isinstance(ws.cell(rr,2),MergedCell): ws.cell(rr,2).value=base["source_feeder_name"] or base["feeder_name"]
+        if not isinstance(ws.cell(rr,3),MergedCell): ws.cell(rr,3).value=base["voltage_kv"]
+        if not isinstance(ws.cell(rr,4),MergedCell): ws.cell(rr,4).value=base["source_meter_no"] or base["meter_no"]
+        if not isinstance(ws.cell(rr,5),MergedCell): ws.cell(rr,5).value=base["mf"]
+        if present is None: continue
+
+        direct_mu=base["master_direct_mu"]
         if direct_mu is not None:
-            # Meter unavailable/defective: write the supplied MU directly.
-            # Import is positive; Export is negative in Net Energy Injection.
-            signed_mu = float(direct_mu) * (-1 if "EXPORT" in flows and "IMPORT" not in flows else 1)
-            ws.cell(r, 11).value = signed_mu * 1000.0
-            ws.cell(r, 12).value = signed_mu
-            if not isinstance(ws.cell(r,2), MergedCell): ws.cell(r,2).value = base["feeder_name"]
-            if not isinstance(ws.cell(r,4), MergedCell): ws.cell(r,4).value = base["meter_no"]
-            if not isinstance(ws.cell(r,5), MergedCell): ws.cell(r,5).value = base["mf"]
-            if not isinstance(ws.cell(r,3), MergedCell): ws.cell(r,3).value = base["voltage_kv"]
+            signed=abs(float(direct_mu))*(-1 if "EXPORT" in flows and "IMPORT" not in flows else 1)
+            ws.cell(rr,11).value=signed*(1000000 if sheet_name=="Jorhat-ONE" else 1000)
+            ws.cell(rr,12).value=signed
             continue
-        if present is None:
-            continue
-        prev = get_previous_reading(con, base["feeder_id"], year, month)
-        prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (base["feeder_id"], year, year, month)).fetchone()
-        if prior is None and base["baseline_reading_kwh"] is not None:
-            prev = float(base["baseline_reading_kwh"])
-        if prev is None:
-            continue
-        ws.cell(r, 6).value = prev
-        ws.cell(r, 7).value = present
-        ws.cell(r, 8).value = f"=G{r}-F{r}"
-        if not isinstance(ws.cell(r,5), MergedCell): ws.cell(r,5).value = base["mf"]
-        if not isinstance(ws.cell(r,4), MergedCell): ws.cell(r,4).value = base["meter_no"]
-        if not isinstance(ws.cell(r,3), MergedCell): ws.cell(r,3).value = base["voltage_kv"]
-        if not isinstance(ws.cell(r,2), MergedCell): ws.cell(r,2).value = base["feeder_name"]
-        if "IMPORT" in flows: ws.cell(r, 9).value = f"=H{r}*E{r}"
-        if "EXPORT" in flows: ws.cell(r, 10).value = f"=H{r}*E{r}"
-        if flows:
-            ws.cell(r, 11).value = f"=I{r}-J{r}"
-            ws.cell(r, 12).value = f"=K{r}/1000"
 
-    if sheet_name == "Jorhat-ONE":
-        _, a_start, a_end, a_total = live_sections[0]
-        ws.cell(a_total, 11).value = "TOTAL:-"; ws.cell(a_total, 12).value = f"=SUM(L{a_start}:L{a_end})"
-        summary_row = None
-        final_row = None
-        for rr in range(1, ws.max_row+1):
+        prev=get_previous_division_reading(con,base["map_id"],base["feeder_id"],year,month,base["baseline_reading_kwh"])
+        if prev is None: continue
+        ws.cell(rr,6).value=prev
+        ws.cell(rr,7).value=present
+        ws.cell(rr,8).value=f"=G{rr}-F{rr}"
+        imp="IMPORT" in flows; exp="EXPORT" in flows
+        if imp: ws.cell(rr,9).value=f"=H{rr}*E{rr}"+("*1000" if multiplier==1000 else "")
+        if exp: ws.cell(rr,10).value=f"=H{rr}*E{rr}"+("*1000" if multiplier==1000 else "")
+        if imp and exp:
+            ws.cell(rr,11).value=f"=I{rr}-J{rr}"; ws.cell(rr,12).value=f"=K{rr}/{divisor}"
+        elif exp:
+            ws.cell(rr,11).value=f"=J{rr}"; ws.cell(rr,12).value=f"=-K{rr}/{divisor}"
+        else:
+            ws.cell(rr,11).value=f"=I{rr}"; ws.cell(rr,12).value=f"=K{rr}/{divisor}"
+
+    if sheet_name=="Jorhat-ONE":
+        _,a_start,a_end,a_total=live_sections[0]
+        ws.cell(a_total,11).value="TOTAL:-"; ws.cell(a_total,12).value=f"=SUM(L{a_start}:L{a_end})"
+        summary_row=final_row=None
+        for rr in range(1,ws.max_row+1):
             text=ws.cell(rr,2).value
             if isinstance(text,str) and "TOTAL ENERGY INJECTION" in text: summary_row=rr
-            if isinstance(text,str) and text.strip().startswith("JORHAT-ONE") : final_row=rr
+            if isinstance(text,str) and text.strip().startswith("JORHAT-ONE"): final_row=rr
         if summary_row: ws.cell(summary_row,9).value=f"=L{a_total}"
         if final_row and summary_row: ws.cell(final_row,7).value=f"=I{summary_row}"
-    elif sheet_name == "Teok^":
-        _, a_start, a_end, a_total = live_sections[0]; _, b_start, b_end, b_total = live_sections[1]
+    elif sheet_name=="Teok^":
+        _,a_start,a_end,a_total=live_sections[0]; _,b_start,b_end,b_total=live_sections[1]
         ws.cell(a_total,11).value="TOTAL:-"; ws.cell(a_total,12).value=f"=SUM(L{a_start}:L{a_end})"
         ws.cell(b_total,11).value="TOTAL:-"; ws.cell(b_total,12).value=f"=SUM(L{b_start}:L{b_end})"
-        teok_sum = kakojan_sum = total_power = None
-        for r in range(1,ws.max_row+1):
-            texts=[ws.cell(r,c).value for c in range(1, min(ws.max_column,12)+1)]
-            joined=" | ".join(str(x) for x in texts if x is not None)
-            if "ENERGY INJECTED TO TEOK ELEC. SUB-DIV" in joined:
-                teok_sum=r; ws.cell(r,9).value=f"=L{a_total}"
-            elif "ENERGY INJECTED TO KAKOJAN ELEC. SUB-DIV" in joined:
-                kakojan_sum=r; ws.cell(r,9).value=f"=L{b_total}"
-            elif "TOTAL POWER" in joined:
-                total_power=r
+        teok_sum=kakojan_sum=total_power=None
+        for rr in range(1,ws.max_row+1):
+            joined=" | ".join(str(ws.cell(rr,col).value) for col in range(1,min(ws.max_column,12)+1) if ws.cell(rr,col).value is not None)
+            if "ENERGY INJECTED TO TEOK ELEC. SUB-DIV" in joined: teok_sum=rr; ws.cell(rr,9).value=f"=L{a_total}"
+            elif "ENERGY INJECTED TO KAKOJAN ELEC. SUB-DIV" in joined: kakojan_sum=rr; ws.cell(rr,9).value=f"=L{b_total}"
+            elif "TOTAL POWER" in joined: total_power=rr
         if total_power and teok_sum and kakojan_sum: ws.cell(total_power,9).value=f"=I{teok_sum}+I{kakojan_sum}"
-    elif sheet_name == "Jorhat-TWO":
+    else:
         totals=[]
         for sub,a_start,a_end,a_total in live_sections:
             ws.cell(a_total,11).value="TOTAL:-"; ws.cell(a_total,12).value=f"=SUM(L{a_start}:L{a_end})"; totals.append(a_total)
         sum_rows=[]; total_div=None
-        for r in range(1,ws.max_row+1):
-            texts=[ws.cell(r,c).value for c in range(1,min(ws.max_column,12)+1)]
-            joined=" | ".join(str(x) for x in texts if x is not None)
-            if "ENERGY INJECTED TO TITABAR" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[0]}"
-            elif "ENERGY INJECTED TO MARIANI" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[1]}"
-            elif "ENERGY INJECTED TO MAJULI" in joined: sum_rows.append(r); ws.cell(r,9).value=f"=L{totals[2]}"
-            elif "TOTAL ENERGY INJECTION" in joined: total_div=r
+        for rr in range(1,ws.max_row+1):
+            joined=" | ".join(str(ws.cell(rr,col).value) for col in range(1,min(ws.max_column,12)+1) if ws.cell(rr,col).value is not None)
+            if "ENERGY INJECTED TO TITABAR" in joined: sum_rows.append(rr); ws.cell(rr,9).value=f"=L{totals[0]}"
+            elif "ENERGY INJECTED TO MARIANI" in joined: sum_rows.append(rr); ws.cell(rr,9).value=f"=L{totals[1]}"
+            elif "ENERGY INJECTED TO MAJULI" in joined: sum_rows.append(rr); ws.cell(rr,9).value=f"=L{totals[2]}"
+            elif "TOTAL ENERGY INJECTION" in joined: total_div=rr
         if total_div and len(sum_rows)==3: ws.cell(total_div,12).value="="+"+".join(f"I{x}" for x in sum_rows)
 
     try:
         wb.calculation.fullCalcOnLoad=True; wb.calculation.forceFullCalc=True; wb.calculation.calcMode="auto"
     except Exception: pass
     out=io.BytesIO(); wb.save(out); out.seek(0); return out
-
 
 def bootstrap_from_template(con):
     """Seed feeder master + June 2026 readings from the supplied workbook once."""
@@ -1122,33 +1105,53 @@ def get_previous_reading(con, feeder_id, year, month):
     return None if row is None else float(row["initial_reading_kwh"])
 
 def save_reading(con, feeder_id, year, month, reading_kwh, remarks=""):
-    existing = con.execute(
-        "SELECT last_reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
-        (feeder_id, year, month)
-    ).fetchone()
-    last_reading = None if existing is None else existing["last_reading_kwh"]
-    if last_reading is None:
-        last_reading = get_previous_reading(con, feeder_id, year, month)
-
-    con.execute("""
-        INSERT INTO monthly_readings
-            (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks)
+    # Circle/master reading path. Keep this unchanged for Circle accounting.
+    existing=con.execute("SELECT last_reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",(feeder_id,year,month)).fetchone()
+    last_reading=None if existing is None else existing["last_reading_kwh"]
+    if last_reading is None: last_reading=get_previous_reading(con,feeder_id,year,month)
+    con.execute("""INSERT INTO monthly_readings
+        (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks)
         VALUES(?,?,?,?,?,?)
-        ON CONFLICT(feeder_id,year,month)
-        DO UPDATE SET
+        ON CONFLICT(feeder_id,year,month) DO UPDATE SET
             reading_kwh=excluded.reading_kwh,
-            last_reading_kwh=COALESCE(monthly_readings.last_reading_kwh, excluded.last_reading_kwh),
-            remarks=excluded.remarks,
-            direct_mu=NULL,
-            direct_mu_note=NULL,
-            updated_at=CURRENT_TIMESTAMP
-    """, (feeder_id,year,month,reading_kwh,last_reading,remarks))
-    con.execute("""
-        UPDATE division_row_readings
-        SET reading_kwh=?, updated_at=CURRENT_TIMESTAMP
-        WHERE division_map_id IN (SELECT id FROM division_row_map WHERE feeder_id=?)
-          AND year=? AND month=?
-    """, (reading_kwh, feeder_id, year, month))
+            last_reading_kwh=COALESCE(monthly_readings.last_reading_kwh,excluded.last_reading_kwh),
+            remarks=excluded.remarks,direct_mu=NULL,direct_mu_note=NULL,
+            updated_at=CURRENT_TIMESTAMP""",(feeder_id,year,month,reading_kwh,last_reading,remarks))
+    con.execute("""UPDATE division_row_readings SET reading_kwh=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE division_map_id IN (SELECT id FROM division_row_map WHERE feeder_id=?)
+                     AND year=? AND month=?""",(reading_kwh,feeder_id,year,month))
+    con.commit()
+
+def get_previous_division_reading(con, division_map_id, feeder_id, year, month, baseline=None):
+    row=con.execute("""SELECT reading_kwh FROM division_row_readings
+                       WHERE division_map_id=?
+                         AND (year < ? OR (year=? AND month < ?))
+                       ORDER BY year DESC,month DESC LIMIT 1""",
+                    (division_map_id,year,year,month)).fetchone()
+    if row is not None: return float(row["reading_kwh"])
+    if baseline is not None: return float(baseline)
+    return get_previous_reading(con,feeder_id,year,month)
+
+def save_division_reading(con, division_map_id, year, month, reading_kwh, remarks=""):
+    mapping=con.execute("""SELECT feeder_id,baseline_reading_kwh FROM division_row_map
+                           WHERE id=? AND active=1 LIMIT 1""",(division_map_id,)).fetchone()
+    if mapping is None: raise ValueError("Division feeder mapping no longer exists.")
+    previous=get_previous_division_reading(con,division_map_id,mapping["feeder_id"],year,month,mapping["baseline_reading_kwh"])
+    con.execute("""INSERT INTO division_row_readings(division_map_id,year,month,reading_kwh)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(division_map_id,year,month) DO UPDATE SET
+                     reading_kwh=excluded.reading_kwh,updated_at=CURRENT_TIMESTAMP""",
+                (division_map_id,year,month,float(reading_kwh)))
+    existing=con.execute("SELECT id,last_reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+                         (mapping["feeder_id"],year,month)).fetchone()
+    if existing is None:
+        master_previous=get_previous_reading(con,mapping["feeder_id"],year,month)
+        con.execute("""INSERT INTO monthly_readings(feeder_id,year,month,reading_kwh,last_reading_kwh,remarks)
+                       VALUES(?,?,?,?,?,?)""",
+                    (mapping["feeder_id"],year,month,float(reading_kwh),master_previous,remarks or "Entered from Division"))
+    elif existing["last_reading_kwh"] is None:
+        con.execute("UPDATE monthly_readings SET last_reading_kwh=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (previous,existing["id"]))
     con.commit()
 
 def delete_reading(con, feeder_id, year, month):
@@ -2277,38 +2280,43 @@ if page=="Enter Readings":
 
 
     else:
-        rows=get_scope_rows(con,year,month,"Division",division_name)
+        div_id=get_division_id(con,division_name)
+        if div_id is None:
+            rows=[]
+        else:
+            rows=con.execute("""SELECT m.id AS division_map_id,m.sheet_row,m.sub_division,m.flow_direction,
+                                      m.source_feeder_name,m.source_meter_no,m.baseline_reading_kwh,
+                                      f.id AS feeder_id,f.feeder_name,f.meter_no,f.mf,f.voltage_kv,
+                                      dr.reading_kwh AS row_reading
+                               FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+                               LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+                               WHERE m.division_id=? AND m.active=1
+                               ORDER BY m.sub_division,m.sheet_row,m.id""",
+                           (year,month,div_id)).fetchall()
         if reading_search:
-            rows=[
-                r for r in rows
-                if reading_search in str(r["feeder_name"] or "").casefold()
-                or reading_search in str(r["meter_no"] or "").casefold()
-            ]
-        pending=[r for r in rows if r["reading_id"] is None or _is_mu_template_pending(r)]
+            rows=[r for r in rows if reading_search in str(r["source_feeder_name"] or r["feeder_name"] or "").casefold()
+                  or reading_search in str(r["source_meter_no"] or r["meter_no"] or "").casefold()]
+        pending=[r for r in rows if r["row_reading"] is None]
         done=len(rows)-len(pending)
         st.info(f"{len(pending)} pending · {done} already entered")
         if not pending:
-            st.success("All mapped meters in this division have a reading for this month.")
+            st.success("All mapped division rows have a reading for this month.")
         else:
             total_pages=(len(pending)+9)//10
-            pno=st.number_input(
-                "Page",1,total_pages,1,1,
-                key=f"division_entry_page_{division_name}_{year}_{month}"
-            )
+            pno=st.number_input("Page",1,total_pages,1,1,key=f"division_entry_page_{division_name}_{year}_{month}")
             chunk=pending[(pno-1)*10:pno*10]
             for row in chunk:
                 c1,c2,c3,c4,c5=st.columns([2.8,1.8,1.2,2.0,1.1])
-                c1.write(f"**{row['feeder_name']}**")
-                c2.write(row["meter_no"])
+                c1.write(f"**{row['source_feeder_name'] or row['feeder_name']}**")
+                c2.write(row["source_meter_no"] or row["meter_no"])
                 c3.write(f"MF: {row['mf']}")
-                reading=c4.number_input(
-                    "Reading (kWh)",min_value=0.0,value=0.0,format="%.3f",
-                    key=f"dnew_{division_name}_{year}_{month}_{row['id']}"
-                )
-                if c5.button("Save",key=f"dsave_{division_name}_{year}_{month}_{row['id']}",type="primary"):
-                    save_reading(con,row["id"],year,month,reading)
+                reading=c4.number_input("Reading (kWh)",min_value=0.0,value=0.0,format="%.4f",
+                                        key=f"dnew_{division_name}_{year}_{month}_{row['division_map_id']}")
+                if c5.button("Save",key=f"dsave_{division_name}_{year}_{month}_{row['division_map_id']}",type="primary"):
+                    save_division_reading(con,row["division_map_id"],year,month,reading)
                     st.rerun()
             st.caption(f"Showing feeders {(pno-1)*10+1}–{min(pno*10,len(pending))} of {len(pending)} pending.")
+
 
 # ---------- DIRECT MU ENTRY ----------
 elif page=="Direct MU Entry":
@@ -2779,56 +2787,43 @@ else:
 
     else:
         totals=division_energy_summary(con,year,month,division_name)
-        rows=get_scope_rows(con,year,month,"Division",division_name)
-        entered=sum(1 for r in rows if r["reading_id"] is not None)
-
+        div_id=get_division_id(con,division_name)
+        entered_row=con.execute("""SELECT COUNT(*) AS n
+                                   FROM division_row_readings dr
+                                   JOIN division_row_map dm ON dm.id=dr.division_map_id
+                                   WHERE dm.division_id=? AND dm.active=1 AND dr.year=? AND dr.month=?""",
+                                (div_id,year,month)).fetchone()
+        entered=int(entered_row["n"] if entered_row is not None else 0)
         cols=st.columns(4)
-        cols[0].metric("Import",f"{totals['IMPORT']:,.3f} MWh")
-        cols[1].metric("Export",f"{totals['EXPORT']:,.3f} MWh")
-        cols[2].metric("Net injection",f"{totals['NET']:,.3f} MWh")
-        cols[3].metric("Meters entered",entered)
-
-        st.dataframe({
-            "Flow":["Import","Export","NET"],
-            "Energy (MWh)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]
-        },width="stretch",hide_index=True)
-
+        cols[0].metric("Import",f"{totals['IMPORT']:,.6f} MU")
+        cols[1].metric("Export",f"{totals['EXPORT']:,.6f} MU")
+        cols[2].metric("Net injection",f"{totals['NET']:,.6f} MU")
+        cols[3].metric("Rows entered",entered)
+        st.dataframe({"Flow":["Import","Export","NET"],
+                      "Energy (MU)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]},
+                     width="stretch",hide_index=True)
         st.divider()
         st.subheader("Energy Trend — Last 5 Months")
-        trend=[]
-        y,m=year,month
+        trend=[]; y,m=year,month
         for _ in range(5):
             t=division_energy_summary(con,y,m,division_name)
-            trend.append({
-                "Month":f"{calendar.month_abbr[m]} {y}",
-                "Date":datetime(y,m,1),
-                "Import (MWh)":t["IMPORT"],
-                "Export (MWh)":t["EXPORT"],
-                "Net injection (MWh)":t["NET"],
-            })
+            trend.append({"Month":f"{calendar.month_abbr[m]} {y}","Date":datetime(y,m,1),
+                           "Import (MU)":t["IMPORT"],"Export (MU)":t["EXPORT"],
+                           "Net injection (MU)":t["NET"]})
             y,m=previous_period(y,m)
         trend.reverse()
         trend_df=pd.DataFrame(trend).sort_values("Date").reset_index(drop=True)
-        chart_long=trend_df.melt(
-            id_vars=["Month","Date"],
-            value_vars=["Import (MWh)","Export (MWh)","Net injection (MWh)"],
-            var_name="Series",
-            value_name="MWh",
-        )
+        chart_long=trend_df.melt(id_vars=["Month","Date"],
+                                 value_vars=["Import (MU)","Export (MU)","Net injection (MU)"],
+                                 var_name="Series",value_name="MU")
         month_order=trend_df["Month"].tolist()
         chart=alt.Chart(chart_long).mark_line(point=True).encode(
-            x=alt.X(
-                "Month:N",
-                sort=month_order,
-                axis=alt.Axis(title=None, labelAngle=0, labelOverlap=False),
-            ),
-            y=alt.Y("MWh:Q", title="MWh"),
-            color=alt.Color("Series:N", title=None),
-            tooltip=[
-                alt.Tooltip("Month:N", title="Month"),
-                alt.Tooltip("Series:N", title="Series"),
-                alt.Tooltip("MWh:Q", title="MWh", format=".4f"),
-            ],
+            x=alt.X("Month:N",sort=month_order,axis=alt.Axis(title=None,labelAngle=0,labelOverlap=False)),
+            y=alt.Y("MU:Q",title="MU"),color=alt.Color("Series:N",title=None),
+            tooltip=[alt.Tooltip("Month:N",title="Month"),
+                     alt.Tooltip("Series:N",title="Series"),
+                     alt.Tooltip("MU:Q",title="MU",format=".6f")]
         ).properties(height=360)
         st.altair_chart(chart,width="stretch")
         st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
+
