@@ -1264,11 +1264,19 @@ def get_report_reading_rows(con, year, month):
     return rows
 
 def _is_mu_template_pending(row):
+    # Some legacy/read-only queries only select the feeder master fields.
+    # Missing monthly columns must therefore be treated as "not a template
+    # placeholder", not as an exception.
+    if row["reading_id"] is None:
+        return False
+    keys = row.keys()
+    direct_mu = row["direct_mu"] if "direct_mu" in keys else None
+    reading_kwh = row["reading_kwh"] if "reading_kwh" in keys else None
+    remarks = row["remarks"] if "remarks" in keys else None
     return (
-        row["reading_id"] is not None
-        and row["direct_mu"] is None
-        and float(row["reading_kwh"] or 0) == 0.0
-        and str(row["remarks"] or "").startswith("Added from MU Template")
+        direct_mu is None
+        and float(reading_kwh or 0) == 0.0
+        and str(remarks or "").startswith("Added from MU Template")
     )
 
 def calculate_mu(con, row, year, month):
