@@ -2430,10 +2430,17 @@ if page=="Enter Readings":
             rows=[]
         else:
             rows=con.execute("""SELECT m.id AS division_map_id,m.sheet_row,m.sub_division,m.flow_direction,
-                                      m.source_feeder_name,m.source_meter_no,m.baseline_reading_kwh,
-                                      f.id AS feeder_id,f.feeder_name,f.meter_no,f.mf,f.voltage_kv,
+                                      COALESCE(t.report_feeder_name,m.source_feeder_name,f.feeder_name) AS source_feeder_name,
+                                      COALESCE(dr.meter_no,m.source_meter_no,f.meter_no) AS source_meter_no,
+                                      m.baseline_reading_kwh,
+                                      f.id AS feeder_id,
+                                      COALESCE(dr.mf,f.mf,t.report_mf) AS mf,
+                                      COALESCE(dr.voltage_kv,f.voltage_kv,t.voltage_kv) AS voltage_kv,
                                       dr.reading_kwh AS row_reading
                                FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
+                               LEFT JOIN division_row_template t
+                                 ON t.division_id=m.division_id AND t.sheet_row=m.sheet_row
+                                AND t.flow_direction=m.flow_direction AND t.active=1
                                LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
                                WHERE m.division_id=? AND m.active=1
                                ORDER BY m.sub_division,m.sheet_row,m.id""",
