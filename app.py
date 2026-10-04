@@ -926,20 +926,29 @@ def get_division_id(con, division_name):
 def get_scope_rows(con, year, month, scope, division_name=None):
     if scope == "Circle":
         return get_reading_rows(con, year, month)
-    div_id = get_division_id(con, division_name)
+    div_id=get_division_id(con,division_name)
     if div_id is None:
         return []
     return con.execute(
-        '''SELECT DISTINCT f.*, r.id AS reading_id, r.reading_kwh, r.remarks, r.direct_mu, r.direct_mu_note
-           FROM feeder_master f
-           LEFT JOIN division_row_map dm ON dm.feeder_id=f.id AND dm.division_id=? AND dm.active=1
-           LEFT JOIN monthly_readings r
-             ON r.feeder_id=f.id AND r.year=? AND r.month=?
-           WHERE f.active=1 AND (dm.feeder_id IS NOT NULL OR f.division_name=?)
-           ORDER BY f.subdivision, f.feeder_name, f.meter_no''',
-        (div_id, year, month, division_name)
+        '''SELECT m.id AS id,m.id AS division_map_id,m.sheet_row,m.sub_division,m.flow_direction,
+                  COALESCE(t.report_feeder_name,m.source_feeder_name,f.feeder_name) AS feeder_name,
+                  COALESCE(dr.meter_no,m.source_meter_no,f.meter_no) AS meter_no,
+                  COALESCE(dr.mf,f.mf,t.report_mf) AS mf,
+                  COALESCE(dr.voltage_kv,f.voltage_kv,t.voltage_kv) AS voltage_kv,
+                  dr.reading_kwh AS reading_kwh,
+                  CASE WHEN dr.reading_kwh IS NULL THEN NULL ELSE m.id END AS reading_id,
+                  f.entry_type,f.energy_direction,NULL AS remarks,NULL AS direct_mu,NULL AS direct_mu_note
+           FROM division_row_map m
+           JOIN feeder_master f ON f.id=m.feeder_id
+           LEFT JOIN division_row_template t
+             ON t.division_id=m.division_id AND t.sheet_row=m.sheet_row
+            AND t.flow_direction=m.flow_direction AND t.active=1
+           LEFT JOIN division_row_readings dr
+             ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+           WHERE m.division_id=? AND m.active=1
+           ORDER BY m.sub_division,m.sheet_row,m.id''',
+        (year,month,div_id)
     ).fetchall()
-
 
 def division_energy_summary(con,year,month,division_name):
     div_id=get_division_id(con,division_name)
