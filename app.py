@@ -186,6 +186,8 @@ def db_sqlite():
         last_reading_kwh REAL,
         direct_mu REAL,
         direct_mu_note TEXT,
+        report_section TEXT,
+        report_order INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(feeder_id, year, month),
@@ -253,7 +255,7 @@ def db_sqlite():
         except sqlite3.OperationalError:
             pass
 
-    for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
+    for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER")]:
         try:
             con.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             con.commit()
@@ -330,6 +332,8 @@ class PostgresConnection:
             last_reading_kwh REAL,
             direct_mu REAL,
             direct_mu_note TEXT,
+            report_section TEXT,
+            report_order INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(feeder_id, year, month),
@@ -381,7 +385,7 @@ class PostgresConnection:
         for col, typ in [("division_name", "TEXT"), ("subdivision", "TEXT"), ("voltage_kv", "REAL"), ("energy_direction", "TEXT"), ("selection_type", "TEXT")]:
             self.execute(f"ALTER TABLE feeder_master ADD COLUMN {col} {typ}")
             self.commit()
-        for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
+        for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER")]:
             self.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             self.commit()
         self.execute("""UPDATE feeder_master
@@ -1385,10 +1389,11 @@ def build_report(con, year, month):
     for sec in ["A","B","C"]:
         rows = con.execute("""
             SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
-            FROM feeder_master f
-            LEFT JOIN monthly_readings r
-              ON r.feeder_id=f.id AND r.year=? AND r.month=?
-            WHERE f.active=1 AND f.entry_type=?
+            FROM monthly_readings r
+            JOIN feeder_master f ON f.id=r.feeder_id
+            WHERE r.year=? AND r.month=?
+              AND r.report_section=?
+            ORDER BY r.report_order, r.id
             ORDER BY f.feeder_name, f.meter_no
         """, (year,month,sec)).fetchall()
 
@@ -1416,10 +1421,11 @@ def build_report(con, year, month):
 
         rows=con.execute("""
             SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
-            FROM feeder_master f
-            LEFT JOIN monthly_readings r
-              ON r.feeder_id=f.id AND r.year=? AND r.month=?
-            WHERE f.active=1 AND f.entry_type=?
+            FROM monthly_readings r
+            JOIN feeder_master f ON f.id=r.feeder_id
+            WHERE r.year=? AND r.month=?
+              AND r.report_section=?
+            ORDER BY r.report_order, r.id
             ORDER BY f.feeder_name, f.meter_no
         """,(year,month,sec)).fetchall()
 
