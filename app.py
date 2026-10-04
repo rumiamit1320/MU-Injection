@@ -797,7 +797,8 @@ def division_energy_summary(con, year, month, division_name):
         else:
             present = row["row_reading"] if row["row_reading"] is not None else row["master_reading"]
             if present is None: continue
-            prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (row["feeder_id"],year,year,month)).fetchone()            prev = float(row["baseline_reading_kwh"]) if prior is None and row["baseline_reading_kwh"] is not None else get_previous_reading(con,row["feeder_id"],year,month)
+            prior = con.execute("SELECT 1 FROM monthly_readings WHERE feeder_id=? AND (year < ? OR (year=? AND month < ?)) LIMIT 1", (row["feeder_id"],year,year,month)).fetchone()
+            prev = float(row["baseline_reading_kwh"]) if prior is None and row["baseline_reading_kwh"] is not None else get_previous_reading(con,row["feeder_id"],year,month)
             if prev is None: continue
             energy_mwh=(float(present)-prev)*float(row["mf"])
         totals[row["flow_direction"]]+=energy_mwh
