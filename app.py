@@ -396,7 +396,21 @@ class PostgresConnection:
 def db():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if database_url:
-        return PostgresConnection(database_url)
+        # Streamlit reruns the script for every widget interaction. Reusing the
+        # same PostgreSQL connection for the current browser session avoids a
+        # fresh Neon connection + schema initialization on every rerun.
+        existing = st.session_state.get("_postgres_db_connection")
+        if existing is not None:
+            try:
+                if getattr(existing._con, "closed", 1) == 0:
+                    return existing
+            except Exception:
+                pass
+            st.session_state.pop("_postgres_db_connection", None)
+
+        con = PostgresConnection(database_url)
+        st.session_state["_postgres_db_connection"] = con
+        return con
     if os.getenv("RENDER") == "true":
         raise RuntimeError(
             "DATABASE_URL is not configured. This Render deployment requires the Neon PostgreSQL connection string."
