@@ -2634,15 +2634,13 @@ elif page=="MU Template":
                         type="primary",
                         width="stretch",
                     ):
-                        ok, message = add_feeder_to_mu_template(
-                            con,
-                            selected_row["id"],
-                            year,
-                            month,
-                            sec,
-                            initial_reading=initial_reading,
+                        needs_initial = (
+                            initial_reading is None
+                            and already is not None
+                            and already["report_section"] in ("A", "B", "C")
+                            and already["report_section"] != sec
                         )
-                        if initial_reading is None and already is not None and already["report_section"] in ("A", "B", "C") and already["report_section"] != sec:
+                        if needs_initial:
                             st.error("Initial reading is required before adding this feeder to the second section.")
                         else:
                             ok, message = add_feeder_to_mu_template(
