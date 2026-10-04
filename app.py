@@ -2010,7 +2010,23 @@ elif page=="Feeder Master":
                         st.error("This meter number already exists for this selection.")
 
     st.divider()
+    search_text=st.text_input(
+        "Search feeder master",
+        placeholder="Search by feeder name or meter number",
+        type="search",
+        key="feeder_master_search",
+    )
     rows=get_feeders(con,active_only=True)
+    if search_text.strip():
+        needle=search_text.strip().casefold()
+        rows=[
+            row for row in rows
+            if needle in str(row["feeder_name"] or "").casefold()
+            or needle in str(row["meter_no"] or "").casefold()
+        ]
+        st.caption(f"{len(rows)} feeder(s) found.")
+    else:
+        st.caption(f"{len(rows)} active feeder(s).")
 
     for row in rows:
         with st.expander(f"{row['feeder_name']}  ·  {row['meter_no']}  ·  {row['energy_direction']}  ·  {selection_label_for_row(row)}  ·  {row['division_name'] or 'No division'} / {row['subdivision'] or 'No subdivision'}"):
