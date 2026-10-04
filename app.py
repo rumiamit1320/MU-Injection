@@ -1307,8 +1307,9 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 # A detected historical exception is stored as Direct MU above.
                 con.execute("""
                     INSERT INTO monthly_readings
-                    (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks,direct_mu,direct_mu_note)
-                    VALUES(?,?,?,?,?,?,?,?)
+                    (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks,
+                     direct_mu,direct_mu_note,report_section,report_order)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(feeder_id,year,month)
                     DO UPDATE SET
                         reading_kwh=excluded.reading_kwh,
@@ -1316,6 +1317,8 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                         remarks=excluded.remarks,
                         direct_mu=excluded.direct_mu,
                         direct_mu_note=excluded.direct_mu_note,
+                        report_section=excluded.report_section,
+                        report_order=excluded.report_order,
                         updated_at=CURRENT_TIMESTAMP
                 """, (
                     feeder_id, year, month,
@@ -1323,7 +1326,9 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                     last,
                     remarks,
                     manual_mu,
-                    "Imported Direct MU from workbook column H" if manual_mu is not None else None
+                    "Imported Direct MU from workbook column H" if manual_mu is not None else None,
+                    sec,
+                    r
                 ))
                 if manual_mu is not None:
                     direct_mu_imported += 1
@@ -1394,7 +1399,6 @@ def build_report(con, year, month):
             WHERE r.year=? AND r.month=?
               AND r.report_section=?
             ORDER BY r.report_order, r.id
-            ORDER BY f.feeder_name, f.meter_no
         """, (year,month,sec)).fetchall()
 
         start_row,end_row,subtotal=sections[sec]
@@ -1426,7 +1430,6 @@ def build_report(con, year, month):
             WHERE r.year=? AND r.month=?
               AND r.report_section=?
             ORDER BY r.report_order, r.id
-            ORDER BY f.feeder_name, f.meter_no
         """,(year,month,sec)).fetchall()
 
         serial=0
