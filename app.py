@@ -1175,25 +1175,30 @@ def record_meter_change(con, feeder_id, year, month, old_row, new_meter_no, new_
     if old_row["meter_no"] == new_meter_no and abs(float(old_row["mf"]) - float(new_mf)) < 1e-12:
         return
     old_last = get_previous_reading(con, feeder_id, year, month)
-    con.execute(
-        """INSERT INTO meter_change_history
-           (feeder_id,year,month,old_feeder_name,old_meter_no,old_mf,
-            old_last_reading_kwh,old_entry_type,new_meter_no,new_mf)
-           VALUES(?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(feeder_id,year,month)
-           DO UPDATE SET
-             old_feeder_name=excluded.old_feeder_name,
-             old_meter_no=excluded.old_meter_no,
-             old_mf=excluded.old_mf,
-             old_last_reading_kwh=excluded.old_last_reading_kwh,
-             old_entry_type=excluded.old_entry_type,
-             new_meter_no=excluded.new_meter_no,
-             new_mf=excluded.new_mf,
-             created_at=CURRENT_TIMESTAMP""",
-        (feeder_id,year,month,old_row["feeder_name"],old_row["meter_no"],
-         float(old_row["mf"]),old_last,old_row["entry_type"],
-         new_meter_no,float(new_mf))
-    )
+    existing = con.execute(
+        """SELECT id FROM meter_change_history
+           WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
+        (feeder_id, year, month)
+    ).fetchone()
+    if existing is None:
+        con.execute(
+            """INSERT INTO meter_change_history
+               (feeder_id,year,month,old_feeder_name,old_meter_no,old_mf,
+                old_last_reading_kwh,old_entry_type,new_meter_no,new_mf)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (feeder_id,year,month,old_row["feeder_name"],old_row["meter_no"],
+             float(old_row["mf"]),old_last,old_row["entry_type"],
+             new_meter_no,float(new_mf))
+        )
+    else:
+        # Preserve the first/original old meter for this month. Only the latest
+        # new meter/MF is updated if the master is edited again in the same month.
+        con.execute(
+            """UPDATE meter_change_history
+               SET new_meter_no=?, new_mf=?, created_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (new_meter_no,float(new_mf),existing["id"])
+        )
 
 
 def update_feeder(con, feeder_id, feeder_name, meter_no, mf, entry_type, initial, division_name, subdivision, voltage_kv, energy_direction, selection_type=None, year=None, month=None):
@@ -1265,9 +1270,13 @@ def calculate_mu(con, row, year, month):
     # It is stored as a positive magnitude; report logic applies Import/Export sign.
     if row["direct_mu"] is not None:
         return float(row["direct_mu"])
-    prev = row["last_reading_kwh"]
-    if prev is None:
-        prev = get_previous_reading(con, row["id"], year, month)
+    change = get_meter_change(con, row["id"], year, month)
+    if change is not None and change["old_meter_no"] != change["new_meter_no"]:
+        prev = float(row["initial_reading_kwh"])
+    else:
+        prev = row["last_reading_kwh"]
+        if prev is None:
+            prev = get_previous_reading(con, row["id"], year, month)
     if prev is None or row["reading_kwh"] is None:
         return None
     return (float(row["reading_kwh"]) - float(prev)) * float(row["mf"]) / 1000.0
