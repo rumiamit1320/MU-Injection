@@ -1247,9 +1247,11 @@ def get_previous_division_reading(con, division_map_id, feeder_id, year, month, 
                          AND (year < ? OR (year=? AND month < ?))
                        ORDER BY year DESC,month DESC LIMIT 1""",
                     (division_map_id,year,year,month)).fetchone()
-    if row is not None: return float(row["reading_kwh"])
-    if baseline is not None: return float(baseline)
-    return get_previous_reading(con,feeder_id,year,month)
+    if row is not None:
+        return float(row["reading_kwh"])
+    if baseline is not None:
+        return float(baseline)
+    return None
 
 def save_division_reading(con, division_map_id, year, month, reading_kwh, remarks=""):
     mapping=con.execute("""SELECT feeder_id,baseline_reading_kwh FROM division_row_map
