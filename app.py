@@ -766,134 +766,122 @@ def ensure_division_template_reference(con):
 def import_division_workbook(con, uploaded_bytes, year, month, division_name, overwrite=False):
     if division_name not in DIVISIONS:
         raise ValueError("Unknown division.")
-    sheet_name = DIVISIONS[division_name]
-    wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
+    sheet_name=DIVISIONS[division_name]
+    wb=openpyxl.load_workbook(io.BytesIO(uploaded_bytes),data_only=False)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Workbook does not contain the '{sheet_name}' sheet.")
-    ws = wb[sheet_name]
-    div_id = DIVISION_TO_ID[division_name]
+    ws=wb[sheet_name]
+    div_id=DIVISION_TO_ID[division_name]
+    ensure_division_template_reference(con)
+    refs=con.execute("""SELECT * FROM division_row_template
+                        WHERE division_id=? AND active=1
+                        ORDER BY sheet_row,flow_direction""",(div_id,)).fetchall()
+    imported=reused=new_master=mapped=0
+    skipped=[]
+    used_targets=set()
 
-    imported = reused = new_master = mapped = 0
-    skipped = []
+    def match_reference(feeder_name,meter,flow):
+        candidates=[x for x in refs if x["flow_direction"]==flow and
+                    (x["sheet_row"],x["flow_direction"]) not in used_targets]
+        name_key=_division_identity_key(feeder_name)
+        meter_key=str(meter or "").strip().casefold()
+        exact_name=[x for x in candidates if name_key and _division_identity_key(x["report_feeder_name"])==name_key]
+        if exact_name:
+            return exact_name[0]
+        exact_meter=[x for x in candidates if meter_key and str(x["report_meter_no"] or "").strip().casefold()==meter_key]
+        return exact_meter[0] if exact_meter else None
 
     try:
         con.execute("BEGIN")
-        for start, end in division_row_ranges(sheet_name):
-            current_sub = None
-            for r in range(start, end + 1):
-                a = merged_cell_value(ws, r, 1)
-                b = merged_cell_value(ws, r, 2)
-                d = merged_cell_value(ws, r, 4)
-                e = merged_cell_value(ws, r, 5)
-                voltage = merged_cell_value(ws, r, 3)
-                f = merged_cell_value(ws, r, 6)
-                g = merged_cell_value(ws, r, 7)
-                i_cell = ws.cell(r, 9).value
-                j_cell = ws.cell(r, 10).value
-
-                if isinstance(a, str) and "SUB-DIVISION" in a.upper():
-                    current_sub = a.strip()
+        for start_row,end_row in division_row_ranges(sheet_name):
+            current_sub=None
+            for r in range(start_row,end_row+1):
+                if isinstance(ws.cell(r,2),MergedCell):
                     continue
-                if not isinstance(f, (int, float)) and not isinstance(g, (int, float)):
+                a=merged_cell_value(ws,r,1); b=merged_cell_value(ws,r,2)
+                d=merged_cell_value(ws,r,4); e=merged_cell_value(ws,r,5)
+                voltage=merged_cell_value(ws,r,3); f=merged_cell_value(ws,r,6)
+                g=merged_cell_value(ws,r,7); i_cell=ws.cell(r,9).value; j_cell=ws.cell(r,10).value
+                if isinstance(a,str) and "SUB-DIVISION" in a.upper():
+                    current_sub=a.strip()
+                    continue
+                if i_cell is None and j_cell is None:
                     continue
                 if d is None and b is None:
                     continue
-
-                feeder_name = str(b).strip() if b is not None else f"{division_name} row {r}"
-                meter = str(d).strip() if d is not None else f"__{sheet_name}__ROW__{r}"
-                mf = _to_float(e) or 1.0
-                present = _to_float(g)
-                last = _to_float(f)
+                feeder_name=str(b).strip() if b is not None else f"{division_name} row {r}"
+                meter=str(d).strip() if d is not None else ""
+                mf=_to_float(e) or 1.0
+                present=_to_float(g); last=_to_float(f)
                 if present is None:
+                    if (i_cell==0 or j_cell==0) and not meter:
+                        continue
                     skipped.append(f"Row {r}: {feeder_name} — present reading is blank")
                     continue
-
-                flows = []
-                if i_cell is not None:
-                    flows.append("IMPORT")
-                if j_cell is not None:
-                    flows.append("EXPORT")
-                if not flows:
-                    continue
-
+                flows=[]
+                if i_cell is not None: flows.append("IMPORT")
+                if j_cell is not None: flows.append("EXPORT")
                 for flow in flows:
-                    fid, created = find_or_create_meter_master(
-                        con, feeder_name, meter, mf, preferred_entry_type_for_flow(flow),
-                        year, month, present, division_name,
-                        normalize_subdivision(division_name, current_sub), _to_float(voltage), flow
-                    )
-                    new_master += int(created)
-
-                    existing = con.execute(
-                        "SELECT id FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
-                        (fid, year, month)
-                    ).fetchone()
-
-                    prior = con.execute(
-                        '''SELECT 1 FROM monthly_readings
-                           WHERE feeder_id=? AND
-                           (year < ? OR (year=? AND month < ?)) LIMIT 1''',
-                        (fid, year, year, month)
-                    ).fetchone()
-                    if existing is None and prior is None and last is not None:
-                        con.execute(
-                            "UPDATE feeder_master SET initial_reading_kwh=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                            (last, fid)
-                        )
-
-                    if existing is None:
-                        con.execute(
-                            "INSERT INTO monthly_readings (feeder_id,year,month,reading_kwh,remarks) VALUES(?,?,?,?,?)",
-                            (fid, year, month, present, f"Imported from {division_name}")
-                        )
-                        imported += 1
-                    elif overwrite:
-                        # The master monthly reading is shared, but a division
-                        # workbook can contain the same meter more than once
-                        # with different import/export readings.  The exact
-                        # row-level value is stored separately below.
-                        con.execute(
-                            "UPDATE monthly_readings SET reading_kwh=?, remarks=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                            (present, f"Imported from {division_name}", existing["id"])
-                        )
-                        reused += 1
+                    ref=match_reference(feeder_name,meter,flow)
+                    if ref is not None:
+                        target_row=ref["sheet_row"]; target_sub=ref["subdivision"]
+                        report_name=ref["report_feeder_name"]
+                        used_targets.add((target_row,flow))
                     else:
-                        reused += 1
+                        target_row=None
+                        target_sub=normalize_subdivision(division_name,current_sub)
+                        report_name=feeder_name
 
-                    con.execute(
-                        '''INSERT INTO division_row_map
-                           (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh)
-                           VALUES(?,?,?,?,?,?,?,?)
-                           ON CONFLICT(division_id,sheet_row,flow_direction)
-                           DO UPDATE SET feeder_id=excluded.feeder_id,
-                             sub_division=excluded.sub_division,
-                             source_feeder_name=excluded.source_feeder_name,
-                             source_meter_no=excluded.source_meter_no,
-                             baseline_reading_kwh=excluded.baseline_reading_kwh,
-                             active=1''',
-                        (div_id, r, current_sub, fid, flow, feeder_name, meter, last)
-                    )
-                    map_row = con.execute(
-                        "SELECT id FROM division_row_map WHERE division_id=? AND sheet_row=? AND flow_direction=?",
-                        (div_id, r, flow)
-                    ).fetchone()
+                    fid,created=find_or_create_meter_master(
+                        con,feeder_name,meter,mf,preferred_entry_type_for_flow(flow),
+                        year,month,present,division_name,target_sub,_to_float(voltage),flow)
+                    new_master+=int(created)
+
+                    existing=con.execute(
+                        "SELECT id FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+                        (fid,year,month)).fetchone()
+                    if existing is None:
+                        con.execute("""INSERT INTO monthly_readings
+                            (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks)
+                            VALUES(?,?,?,?,?,?)""",
+                            (fid,year,month,present,last,f"Imported from {division_name}"))
+                        imported+=1
+                    elif overwrite:
+                        con.execute("""UPDATE monthly_readings SET reading_kwh=?,last_reading_kwh=?,
+                                       remarks=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                                    (present,last,f"Imported from {division_name}",existing["id"]))
+                        reused+=1
+                    else:
+                        reused+=1
+
+                    if target_row is None:
+                        target_row=-fid
+                    con.execute("""INSERT INTO division_row_map
+                        (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh,active)
+                        VALUES(?,?,?,?,?,?,?,?,1)
+                        ON CONFLICT(division_id,sheet_row,flow_direction) DO UPDATE SET
+                          sub_division=excluded.sub_division,feeder_id=excluded.feeder_id,
+                          source_feeder_name=excluded.source_feeder_name,source_meter_no=excluded.source_meter_no,
+                          active=1""",
+                        (div_id,target_row,target_sub,fid,flow,report_name,meter,last))
+                    map_row=con.execute("""SELECT id FROM division_row_map
+                                           WHERE division_id=? AND sheet_row=? AND flow_direction=?""",
+                                        (div_id,target_row,flow)).fetchone()
                     if map_row is not None:
-                        con.execute(
-                            """INSERT INTO division_row_readings (division_map_id,year,month,reading_kwh)
-                               VALUES(?,?,?,?)
-                               ON CONFLICT(division_map_id,year,month) DO UPDATE SET
-                                 reading_kwh=excluded.reading_kwh, updated_at=CURRENT_TIMESTAMP""",
-                            (map_row["id"], year, month, present)
-                        )
-                    mapped += 1
+                        con.execute("""INSERT INTO division_row_readings
+                            (division_map_id,year,month,reading_kwh,last_reading_kwh,meter_no,mf,feeder_name,voltage_kv)
+                            VALUES(?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(division_map_id,year,month) DO UPDATE SET
+                              reading_kwh=excluded.reading_kwh,last_reading_kwh=excluded.last_reading_kwh,
+                              meter_no=excluded.meter_no,mf=excluded.mf,feeder_name=excluded.feeder_name,
+                              voltage_kv=excluded.voltage_kv,updated_at=CURRENT_TIMESTAMP""",
+                            (map_row["id"],year,month,present,last,meter,mf,report_name,_to_float(voltage)))
+                    mapped+=1
         con.commit()
     except Exception:
         con.rollback()
         raise
-
-    return {"imported": imported, "reused": reused, "new_master": new_master,
-            "mapped": mapped, "skipped": skipped}
-
+    return {"imported":imported,"reused":reused,"new_master":new_master,"mapped":mapped,"skipped":skipped}
 
 
 def import_all_division_workbook(con, uploaded_bytes, year, month, overwrite=False):
