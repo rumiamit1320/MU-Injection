@@ -183,6 +183,7 @@ def db_sqlite():
         month INTEGER NOT NULL,
         reading_kwh REAL NOT NULL,
         remarks TEXT,
+        last_reading_kwh REAL,
         direct_mu REAL,
         direct_mu_note TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -252,7 +253,7 @@ def db_sqlite():
         except sqlite3.OperationalError:
             pass
 
-    for col, typ in [("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
+    for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
         try:
             con.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             con.commit()
@@ -326,6 +327,7 @@ class PostgresConnection:
             month INTEGER NOT NULL,
             reading_kwh REAL NOT NULL,
             remarks TEXT,
+            last_reading_kwh REAL,
             direct_mu REAL,
             direct_mu_note TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -379,7 +381,7 @@ class PostgresConnection:
         for col, typ in [("division_name", "TEXT"), ("subdivision", "TEXT"), ("voltage_kv", "REAL"), ("energy_direction", "TEXT"), ("selection_type", "TEXT")]:
             self.execute(f"ALTER TABLE feeder_master ADD COLUMN {col} {typ}")
             self.commit()
-        for col, typ in [("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
+        for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT")]:
             self.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             self.commit()
         self.execute("""UPDATE feeder_master
@@ -498,7 +500,6 @@ def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="
             candidates,
             key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
         )
-
         # Division workbooks occasionally show the same meter number twice with
         # different present readings. If a matching monthly reading already
         # exists, bind the division row to that meter instance.
@@ -997,8 +998,7 @@ def bootstrap_from_template(con):
     ranges = {"A": range(7,31), "B": range(34,43), "C": range(46,51)}
     for sec, rows in ranges.items():
         for r in rows:
-            feeder = ws.cell(r,2).value
-            meter = ws.cell(r,3).value
+            feeder = ws.cell(r,2).value            meter = ws.cell(r,3).value
             last = ws.cell(r,4).value
             present = ws.cell(r,5).value
             mf = ws.cell(r,7).value
@@ -1060,18 +1060,27 @@ def get_previous_reading(con, feeder_id, year, month):
     return None if row is None else float(row["initial_reading_kwh"])
 
 def save_reading(con, feeder_id, year, month, reading_kwh, remarks=""):
+    existing = con.execute(
+        "SELECT last_reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+        (feeder_id, year, month)
+    ).fetchone()
+    last_reading = None if existing is None else existing["last_reading_kwh"]
+    if last_reading is None:
+        last_reading = get_previous_reading(con, feeder_id, year, month)
+
     con.execute("""
         INSERT INTO monthly_readings
-            (feeder_id,year,month,reading_kwh,remarks)
-        VALUES(?,?,?,?,?)
+            (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks)
+        VALUES(?,?,?,?,?,?)
         ON CONFLICT(feeder_id,year,month)
         DO UPDATE SET
             reading_kwh=excluded.reading_kwh,
+            last_reading_kwh=COALESCE(monthly_readings.last_reading_kwh, excluded.last_reading_kwh),
             remarks=excluded.remarks,
             direct_mu=NULL,
             direct_mu_note=NULL,
             updated_at=CURRENT_TIMESTAMP
-    """, (feeder_id,year,month,reading_kwh,remarks))
+    """, (feeder_id,year,month,reading_kwh,last_reading,remarks))
     con.execute("""
         UPDATE division_row_readings
         SET reading_kwh=?, updated_at=CURRENT_TIMESTAMP
@@ -1138,7 +1147,7 @@ def get_feeders(con, active_only=True):
 
 def get_reading_rows(con, year, month):
     return con.execute("""
-        SELECT f.*, r.id AS reading_id, r.reading_kwh, r.remarks, r.direct_mu, r.direct_mu_note
+        SELECT f.*, r.id AS reading_id, r.reading_kwh, r.last_reading_kwh, r.remarks, r.direct_mu, r.direct_mu_note
         FROM feeder_master f
         LEFT JOIN monthly_readings r
           ON r.feeder_id=f.id AND r.year=? AND r.month=?
@@ -1153,10 +1162,12 @@ def calculate_mu(con, row, year, month):
     # It is stored as a positive magnitude; report logic applies Import/Export sign.
     if row["direct_mu"] is not None:
         return float(row["direct_mu"])
-    prev = get_previous_reading(con, row["id"], year, month)
+    prev = row["last_reading_kwh"]
     if prev is None:
+        prev = get_previous_reading(con, row["id"], year, month)
+    if prev is None or row["reading_kwh"] is None:
         return None
-    return (float(row["reading_kwh"]) - prev) * float(row["mf"]) / 1000.0
+    return (float(row["reading_kwh"]) - float(prev)) * float(row["mf"]) / 1000.0
 
 
 def _to_float(value):
@@ -1292,11 +1303,12 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 # A detected historical exception is stored as Direct MU above.
                 con.execute("""
                     INSERT INTO monthly_readings
-                    (feeder_id,year,month,reading_kwh,remarks,direct_mu,direct_mu_note)
-                    VALUES(?,?,?,?,?,?,?)
+                    (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks,direct_mu,direct_mu_note)
+                    VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(feeder_id,year,month)
                     DO UPDATE SET
                         reading_kwh=excluded.reading_kwh,
+                        last_reading_kwh=excluded.last_reading_kwh,
                         remarks=excluded.remarks,
                         direct_mu=excluded.direct_mu,
                         direct_mu_note=excluded.direct_mu_note,
@@ -1304,6 +1316,7 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 """, (
                     feeder_id, year, month,
                     0.0 if present is None else present,
+                    last,
                     remarks,
                     manual_mu,
                     "Imported Direct MU from workbook column H" if manual_mu is not None else None
@@ -1361,8 +1374,8 @@ def build_report(con, year, month):
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb["MU inj JEC"]
 
-    # Build section rows dynamically while retaining the supplied template's
-    # visual style. Original template capacities are A=24, B=9, C=5.
+    # Keep the supplied workbook layout and formatting exactly as the template.
+    # Only populate the existing data cells; formulas remain Excel formulas.
     sections = {
         "A": [7,30,32],
         "B": [34,42,44],
@@ -1371,7 +1384,7 @@ def build_report(con, year, month):
 
     for sec in ["A","B","C"]:
         rows = con.execute("""
-            SELECT f.*, r.reading_kwh, r.direct_mu
+            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
             FROM feeder_master f
             LEFT JOIN monthly_readings r
               ON r.feeder_id=f.id AND r.year=? AND r.month=?
@@ -1379,17 +1392,16 @@ def build_report(con, year, month):
             ORDER BY f.feeder_name, f.meter_no
         """, (year,month,sec)).fetchall()
 
-        start,end,subtotal = sections[sec]
-        capacity=end-start+1
+        start_row,end_row,subtotal=sections[sec]
+        capacity=end_row-start_row+1
         if len(rows)>capacity:
             extra=len(rows)-capacity
             ws.insert_rows(subtotal, amount=extra)
             for rr in range(subtotal,subtotal+extra):
-                copy_row(ws,end,rr)
-            end += extra
+                copy_row(ws,end_row,rr)
+            end_row += extra
             subtotal += extra
-            sections[sec]=[start,end,subtotal]
-            # Inserting rows shifts later sections.
+            sections[sec]=[start_row,end_row,subtotal]
             if sec=="A":
                 sections["B"][0]+=extra; sections["B"][1]+=extra; sections["B"][2]+=extra
                 sections["C"][0]+=extra; sections["C"][1]+=extra; sections["C"][2]+=extra
@@ -1397,13 +1409,13 @@ def build_report(con, year, month):
                 sections["C"][0]+=extra; sections["C"][1]+=extra; sections["C"][2]+=extra
 
     for sec in ["A","B","C"]:
-        start,end,subtotal=sections[sec]
-        for r in range(start,end+1):
+        start_row,end_row,subtotal=sections[sec]
+        for r in range(start_row,end_row+1):
             for c in range(1,10):
                 ws.cell(r,c).value=None
 
         rows=con.execute("""
-            SELECT f.*, r.reading_kwh, r.direct_mu
+            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
             FROM feeder_master f
             LEFT JOIN monthly_readings r
               ON r.feeder_id=f.id AND r.year=? AND r.month=?
@@ -1411,34 +1423,74 @@ def build_report(con, year, month):
             ORDER BY f.feeder_name, f.meter_no
         """,(year,month,sec)).fetchall()
 
-        for i,row in enumerate(rows,1):
-            r=start+i-1
-            direct_mu=row["direct_mu"]
+        serial=0
+        for row in rows:
             present=row["reading_kwh"]
-            prev=get_previous_reading(con,row["id"],year,month) if present is not None else None
-            diff=None if prev is None else float(present)-prev
-            mu=float(direct_mu) if direct_mu is not None else (None if diff is None else diff*float(row["mf"])/1000)
-            ws.cell(r,1).value=i
+            direct_mu=row["direct_mu"]
+            source_last=row["last_reading_kwh"]
+            if source_last is None and present is not None and direct_mu is None:
+                source_last=get_previous_reading(con,row["id"],year,month)
+
+            if present is None and direct_mu is None:
+                continue
+
+            serial += 1
+            r=start_row+serial-1
+            meter_no="" if str(row["meter_no"]).startswith("__DIRECT_MU__") else row["meter_no"]
+            remarks=row["remarks"]
+
+            ws.cell(r,1).value=serial
             ws.cell(r,2).value=row["feeder_name"]
-            ws.cell(r,3).value=row["meter_no"]
-            ws.cell(r,4).value=prev
+            ws.cell(r,3).value=meter_no
+
+            # Direct-MU-only rows do not invent Last/Present/MF values.
+            direct_only = direct_mu is not None and (
+                present is None or source_last is None
+            )
+            if direct_only:
+                ws.cell(r,4).value=None
+                ws.cell(r,5).value=None
+                ws.cell(r,6).value=None
+                ws.cell(r,7).value=None
+                ws.cell(r,8).value=float(direct_mu)
+                ws.cell(r,9).value=remarks
+                continue
+
+            if present is None:
+                serial -= 1
+                for c in range(1,10):
+                    ws.cell(r,c).value=None
+                continue
+
+            if source_last is None:
+                source_last=get_previous_reading(con,row["id"],year,month)
+            if source_last is None:
+                serial -= 1
+                for c in range(1,10):
+                    ws.cell(r,c).value=None
+                continue
+
+            ws.cell(r,4).value=source_last
             ws.cell(r,5).value=present
             ws.cell(r,6).value=f"=E{r}-D{r}"
             ws.cell(r,7).value=row["mf"]
-            if mu is not None:
-                ws.cell(r,8).value=mu
-            else:
-                ws.cell(r,8).value=f"=F{r}*G{r}/1000"
-
-        ws.cell(subtotal,8).value=f"=SUM(H{start}:H{end})"
+            ws.cell(r,8).value=(
+                float(direct_mu)
+                if direct_mu is not None
+                else f"=F{r}*G{r}/1000"
+            )
+            ws.cell(r,9).value=remarks
 
     a_start,a_end,a_sub=sections["A"]
     b_start,b_end,b_sub=sections["B"]
     c_start,c_end,c_sub=sections["C"]
 
     ws.cell(a_sub,1).value="SUB-TOTAL (A)"
+    ws.cell(a_sub,8).value=f"=SUM(H{a_start}:H{a_end})"
     ws.cell(b_sub,2).value="            SUB-TOTAL (B)"
+    ws.cell(b_sub,8).value=f"=SUM(H{b_start}:H{b_end})"
     ws.cell(c_sub,2).value="              SUB-TOTAL (C)"
+    ws.cell(c_sub,8).value=f"=SUM(H{c_start}:H{c_end})"
 
     total_row=c_sub+1
     ws.cell(total_row,1).value="TOTAL ENERGY INJECTED = (A+B)-C"
@@ -1497,8 +1549,7 @@ def style():
     .login-heading { font-size:25px; font-weight:750; color:#f8fafc; margin:0 0 5px; letter-spacing:-.35px; }
     .login-hint { color:#8fa0b7; font-size:13px; margin:0 0 22px; }
     .login-section-label { color:#64748b; font-size:10px; font-weight:800; letter-spacing:1.5px; margin:0 0 8px; }
-    div[data-testid="column"]:has(.login-anchor) div[data-testid="stTextInput"] input {
-      background:#0b1220 !important; border:1px solid #2e3b50 !important;
+    div[data-testid="column"]:has(.login-anchor) div[data-testid="stTextInput"] input {      background:#0b1220 !important; border:1px solid #2e3b50 !important;
       color:#f8fafc !important; -webkit-text-fill-color:#f8fafc !important;
       border-radius:11px !important; min-height:46px !important; padding:0 14px !important;
       box-sizing:border-box !important; }
@@ -1997,8 +2048,7 @@ elif page=="Import Excel":
                     result=import_month_excel(
                         con,uploaded.getvalue(),int(import_year),int(import_month),overwrite
                     )
-                    st.success(
-                        f"Imported {result['imported']} monthly readings. "
+                    st.success(                        f"Imported {result['imported']} monthly readings. "
                         f"Added {result['new_master']} new feeder records. "
                         f"Updated {result['updated_master']} existing feeder records. "
                         f"Overwritten {result['overwritten']} existing monthly readings. "
