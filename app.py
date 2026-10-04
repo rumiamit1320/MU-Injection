@@ -1168,6 +1168,23 @@ def get_reading_rows(con, year, month):
         ORDER BY f.entry_type, f.feeder_name, f.meter_no
     """, (year,month)).fetchall()
 
+def get_report_reading_rows(con, year, month):
+    """Return the exact monthly rows represented in the generated Circle Excel report.
+    When source-report metadata exists for the month, use that set instead of the
+    current feeder master so dashboard totals and Excel totals use identical rows.
+    """
+    rows = con.execute("""
+        SELECT f.*, r.id AS reading_id, r.reading_kwh, r.last_reading_kwh,
+               r.remarks, r.direct_mu, r.direct_mu_note,
+               r.report_section, r.report_order
+        FROM monthly_readings r
+        JOIN feeder_master f ON f.id=r.feeder_id
+        WHERE r.year=? AND r.month=?
+          AND r.report_section IN ('A','B','C')
+        ORDER BY r.report_section, r.report_order, r.id
+    """, (year, month)).fetchall()
+    return rows
+
 def calculate_mu(con, row, year, month):
     if row["reading_id"] is None:
         return None
@@ -1378,13 +1395,21 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
 
 
 def month_energy_summary(con, year, month):
-    rows = get_reading_rows(con, year, month)
+    # The Circle dashboard must use the same monthly report rows as the
+    # generated Excel workbook. This prevents current feeder-master records
+    # that were not present in the historical source workbook from changing
+    # dashboard totals.
+    rows = get_report_reading_rows(con, year, month)
+    if not rows:
+        # Preserve the existing workflow for months entered manually without
+        # imported report-row metadata.
+        rows = get_reading_rows(con, year, month)
+
     totals = {"A": 0.0, "B": 0.0, "C": 0.0}
     for row in rows:
-        if row["reading_id"] is not None:
-            mu = calculate_mu(con, row, year, month)
-            if mu is not None:
-                totals[row["entry_type"]] += mu
+        mu = calculate_mu(con, row, year, month)
+        if mu is not None:
+            totals[row["entry_type"]] += mu
     totals["NET"] = totals["A"] + totals["B"] - totals["C"]
     return totals
 
@@ -2126,15 +2151,18 @@ else:
     st.subheader(f"Dashboard — {scope_label} — {calendar.month_name[month]} {year}")
 
     if scope=="Circle":
-        rows=get_scope_rows(con,year,month,"Circle",None)
+        # Use the exact monthly rows represented by the generated Circle Excel
+        # whenever report metadata is available for this month.
+        rows=get_report_reading_rows(con,year,month)
+        if not rows:
+            rows=get_scope_rows(con,year,month,"Circle",None)
         totals={"A":0.0,"B":0.0,"C":0.0}
         counts={"A":0,"B":0,"C":0}
         for r in rows:
-            if r["reading_id"] is not None:
+            mu=calculate_mu(con,r,year,month)
+            if mu is not None:
                 counts[r["entry_type"]]+=1
-                mu=calculate_mu(con,r,year,month)
-                if mu is not None:
-                    totals[r["entry_type"]]+=mu
+                totals[r["entry_type"]]+=mu
         net=totals["A"]+totals["B"]-totals["C"]
 
         cols=st.columns(4)
