@@ -1337,8 +1337,8 @@ def save_division_reading(con, division_map_id, year, month, reading_kwh, remark
     if mapping is None: raise ValueError("Division feeder mapping no longer exists.")
     previous=get_previous_division_reading(con,division_map_id,mapping["feeder_id"],year,month,mapping["baseline_reading_kwh"])
     meter=mapping["meter_no"] or mapping["source_meter_no"]
-    mf=mapping["mf"] if mapping["mf"] is not None else mapping["template_mf"]
-    feeder_name=mapping["template_feeder_name"] or mapping["feeder_name"]
+    mf=mapping["mf"] if mapping["mf"] is not None else mapping["report_mf"]
+    feeder_name=mapping["report_feeder_name"] or mapping["feeder_name"]
     voltage=mapping["voltage_kv"] if mapping["voltage_kv"] is not None else mapping["template_voltage"]
     con.execute("""INSERT INTO division_row_readings
                    (division_map_id,year,month,reading_kwh,last_reading_kwh,meter_no,mf,feeder_name,voltage_kv)
