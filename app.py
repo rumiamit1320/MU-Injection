@@ -561,37 +561,32 @@ def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="
         )
         return exact["id"], False
 
-    if candidates:
+    # If a meter exists under another direction but the requested direction
+    # does not exist yet, create the requested master instead of overwriting
+    # or reusing the opposite-direction master.
+    if candidates and year is not None and month is not None and present is not None:
         priority = {"C": ["C","B","A"], "A": ["B","A","C"], "B": ["B","A","C"]}.get(
             preferred_type, [preferred_type,"B","A","C"]
         )
-        ordered = sorted(
-            candidates,
-            key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
-        )
-        if year is not None and month is not None and present is not None:
-            matching = []
-            for candidate in candidates:
-                rr = con.execute(
-                    "SELECT reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
-                    (candidate["id"], year, month)
-                ).fetchone()
-                if rr is not None and abs(float(rr["reading_kwh"]) - float(present)) < 1e-9:
-                    matching.append(candidate)
-            if matching:
-                ordered = sorted(
-                    matching,
-                    key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
-                )
-
-        chosen = ordered[0]
-        fid = chosen["id"]
-        chosen_name = master_name if chosen["entry_type"] == preferred_type else _directional_master_name(feeder_name, chosen["entry_type"])
-        con.execute(
-            "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (chosen_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if chosen["entry_type"]=="C" else "IMPORT"), fid)
-        )
-        return fid, False
+        matching = []
+        for candidate in candidates:
+            rr = con.execute(
+                "SELECT reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
+                (candidate["id"], year, month)
+            ).fetchone()
+            if rr is not None and abs(float(rr["reading_kwh"]) - float(present)) < 1e-9:
+                matching.append(candidate)
+        if matching:
+            chosen = sorted(
+                matching,
+                key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
+            )[0]
+            chosen_name = _directional_master_name(feeder_name, chosen["entry_type"]) if chosen["entry_type"] != preferred_type else master_name
+            con.execute(
+                "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (chosen_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if chosen["entry_type"]=="C" else "IMPORT"), chosen["id"])
+            )
+            return chosen["id"], False
 
     con.execute(
         "INSERT INTO feeder_master (feeder_name,meter_no,mf,entry_type,initial_reading_kwh,division_name,subdivision,voltage_kv,energy_direction) VALUES(?,?,?,?,0,?,?,?,?)",
