@@ -1618,7 +1618,7 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_read
                 return False, (
                     f"{row['feeder_name']} is already configured in Section "
                     f"{existing_section} for this month. Enter the initial "
-                    "reading to create a separate {('Export' if section == 'C' else 'Import')} "
+                    f"reading to create a separate {('Export' if section == 'C' else 'Import')} "
                     "record in this section."
                 )
 
