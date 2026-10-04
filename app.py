@@ -642,6 +642,127 @@ def division_row_ranges(sheet_name):
     }.get(sheet_name, [])
 
 
+def _division_template_subdivision(division_name, sheet_row):
+    if division_name == "Jorhat-1":
+        return None
+    if division_name == "Teok":
+        return "Teok" if 5 <= sheet_row <= 19 else "Kakojan" if 22 <= sheet_row <= 29 else None
+    if division_name == "Jorhat-2":
+        if 5 <= sheet_row <= 10:
+            return "Titabar"
+        if 13 <= sheet_row <= 21:
+            return "Mariani"
+        if 24 <= sheet_row <= 26:
+            return "Majuli"
+    return None
+
+def _division_identity_key(value):
+    text = str(value or "").strip().casefold()
+    text = re.sub(r"_export\s*$", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+def _division_template_rows(division_name):
+    path = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
+    if not path.exists():
+        return []
+    wb = openpyxl.load_workbook(path, data_only=False)
+    sheet_name = DIVISIONS[division_name]
+    if sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+    rows = []
+    for start, end in division_row_ranges(sheet_name):
+        for r in range(start, end + 1):
+            if isinstance(ws.cell(r, 2), MergedCell):
+                continue
+            feeder = ws.cell(r, 2).value
+            meter = ws.cell(r, 4).value
+            mf = ws.cell(r, 5).value
+            voltage = ws.cell(r, 3).value
+            i_cell = ws.cell(r, 9).value
+            j_cell = ws.cell(r, 10).value
+            if i_cell is None and j_cell is None:
+                continue
+            if feeder is None and meter is None:
+                continue
+            flow = "IMPORT" if i_cell is not None and j_cell is None else "EXPORT" if j_cell is not None and i_cell is None else None
+            if flow is None:
+                continue
+            rows.append({
+                "sheet_row": r,
+                "subdivision": _division_template_subdivision(division_name, r),
+                "feeder_name": str(feeder).strip() if feeder is not None else None,
+                "meter_no": str(meter).strip() if meter is not None else None,
+                "mf": _to_float(mf),
+                "voltage_kv": _to_float(voltage),
+                "flow_direction": flow,
+                "report_sl_no": ws.cell(r, 1).value if isinstance(ws.cell(r, 1).value, (int, float)) else None,
+            })
+    return rows
+
+def ensure_division_template_reference(con):
+    ensure_division_master(con)
+    con.execute("""CREATE TABLE IF NOT EXISTS division_row_template (
+        division_id INTEGER NOT NULL,
+        sheet_row INTEGER NOT NULL,
+        subdivision TEXT,
+        report_feeder_name TEXT,
+        report_meter_no TEXT,
+        report_mf REAL,
+        voltage_kv REAL,
+        flow_direction TEXT NOT NULL,
+        report_sl_no REAL,
+        active INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (division_id, sheet_row, flow_direction)
+    )""")
+    for col, typ in [("last_reading_kwh","REAL"),("meter_no","TEXT"),("mf","REAL"),("feeder_name","TEXT"),("voltage_kv","REAL")]:
+        try:
+            con.execute(f"ALTER TABLE division_row_readings ADD COLUMN {col} {typ}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    for division_name in DIVISIONS:
+        div_id = DIVISION_TO_ID[division_name]
+        refs = _division_template_rows(division_name)
+        con.execute("UPDATE division_row_template SET active=0 WHERE division_id=?", (div_id,))
+        con.execute("UPDATE division_row_map SET active=0 WHERE division_id=? AND sheet_row>0", (div_id,))
+        for item in refs:
+            con.execute("""INSERT INTO division_row_template
+                (division_id,sheet_row,subdivision,report_feeder_name,report_meter_no,report_mf,voltage_kv,flow_direction,report_sl_no,active)
+                VALUES(?,?,?,?,?,?,?,?,?,1)
+                ON CONFLICT(division_id,sheet_row,flow_direction) DO UPDATE SET
+                  subdivision=excluded.subdivision,report_feeder_name=excluded.report_feeder_name,
+                  report_meter_no=excluded.report_meter_no,report_mf=excluded.report_mf,
+                  voltage_kv=excluded.voltage_kv,report_sl_no=excluded.report_sl_no,active=1""",
+                (div_id,item["sheet_row"],item["subdivision"],item["feeder_name"],item["meter_no"],
+                 item["mf"],item["voltage_kv"],item["flow_direction"],item["report_sl_no"]))
+            if not item["meter_no"]:
+                continue
+            fid,_=find_or_create_meter_master(
+                con,item["feeder_name"] or f"{division_name} row {item['sheet_row']}",
+                item["meter_no"],item["mf"] or 1.0,preferred_entry_type_for_flow(item["flow_direction"]),
+                division_name=division_name,subdivision=item["subdivision"],
+                voltage_kv=item["voltage_kv"],energy_direction=item["flow_direction"])
+            con.execute("""UPDATE feeder_master SET feeder_name=?,mf=?,division_name=?,subdivision=?,
+                           voltage_kv=?,energy_direction=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (item["feeder_name"] or "",item["mf"] or 1.0,division_name,item["subdivision"],
+                         item["voltage_kv"],item["flow_direction"],fid))
+            existing=con.execute("""SELECT id,baseline_reading_kwh FROM division_row_map
+                                    WHERE division_id=? AND sheet_row=? AND flow_direction=? LIMIT 1""",
+                                 (div_id,item["sheet_row"],item["flow_direction"])).fetchone()
+            if existing is None:
+                con.execute("""INSERT INTO division_row_map
+                    (division_id,sheet_row,sub_division,feeder_id,flow_direction,source_feeder_name,source_meter_no,baseline_reading_kwh,active)
+                    VALUES(?,?,?,?,?,?,?,?,1)""",
+                            (div_id,item["sheet_row"],item["subdivision"],fid,item["flow_direction"],
+                             item["feeder_name"],item["meter_no"],None))
+            else:
+                con.execute("""UPDATE division_row_map SET sub_division=?,feeder_id=?,source_feeder_name=?,
+                               source_meter_no=?,active=1 WHERE id=?""",
+                            (item["subdivision"],fid,item["feeder_name"],item["meter_no"],existing["id"]))
+    con.commit()
+
 def import_division_workbook(con, uploaded_bytes, year, month, division_name, overwrite=False):
     if division_name not in DIVISIONS:
         raise ValueError("Unknown division.")
