@@ -103,7 +103,7 @@ def render_login(con):
         st.markdown('<div class="login-section-label">ACCOUNT</div>', unsafe_allow_html=True)
         username = st.text_input("Username", placeholder="Enter your username", label_visibility="collapsed", key="login_username")
         password = st.text_input("Password", type="password", placeholder="Enter your password", label_visibility="collapsed", key="login_password")
-        if st.button("Sign in  →", type="primary", use_container_width=True, key="login_submit"):
+        if st.button("Sign in  →", type="primary", width="stretch", key="login_submit"):
             row = con.execute(
                 "SELECT * FROM app_users WHERE username=? AND active=1 LIMIT 1",
                 (username.strip(),)
@@ -1529,7 +1529,7 @@ st.markdown("""
 with st.sidebar:
     auth_user = st.session_state.get("auth_username", "user")
     st.markdown(f'<div style="color:#94a3b8;font-size:12px;margin-bottom:8px;">Signed in as <b style="color:#f8fafc;">{auth_user}</b></div>', unsafe_allow_html=True)
-    if st.button("↪  Sign out", key="logout_button", use_container_width=True):
+    if st.button("↪  Sign out", key="logout_button", width="stretch"):
         logout()
         st.rerun()
     st.divider()
@@ -1561,11 +1561,11 @@ with st.sidebar:
     scope=st.session_state["scope_level"]
     c1, c2 = st.columns(2, gap="small")
     with c1:
-        st.button("Circle", key="scope_circle", use_container_width=True,
+        st.button("Circle", key="scope_circle", width="stretch",
                   type="primary" if scope=="Circle" else "secondary",
                   on_click=_set_scope_state, args=("Circle",))
     with c2:
-        st.button("Division", key="scope_division", use_container_width=True,
+        st.button("Division", key="scope_division", width="stretch",
                   type="primary" if scope=="Division" else "secondary",
                   on_click=_set_scope_state, args=("Division",))
 
@@ -1590,7 +1590,7 @@ with st.sidebar:
         "Dashboard"
     ]
     for idx, page_name in enumerate(pages):
-        st.button(page_name, key=f"page_nav_{idx}", use_container_width=True,
+        st.button(page_name, key=f"page_nav_{idx}", width="stretch",
                   type="primary" if st.session_state["selected_page"]==page_name else "secondary",
                   on_click=_set_nav_state, args=(page_name,))
     page=st.session_state["selected_page"]
@@ -1784,7 +1784,7 @@ elif page=="Feeder Master":
             energy_direction=c7.selectbox("Energy Direction",["IMPORT","EXPORT"],index=0 if LABEL_TO_TYPE[typ_label] != "C" else 1,key="new_energy_direction",help="For division reports: IMPORT is added to net injection; EXPORT is subtracted.")
             voltage=c8.number_input("Voltage (kV)",min_value=0.0,value=33.0,step=1.0)
             initial=c9.number_input("Initial reading (kWh)",min_value=0.0,value=0.0,format="%.3f",help="Baseline used only when no earlier monthly reading exists. When a historical Excel month is imported, its Last Reading is used automatically as this baseline.")
-            submit=st.form_submit_button("Save new feeder",type="primary",use_container_width=True)
+            submit=st.form_submit_button("Save new feeder",type="primary",width="stretch")
             if submit:
                 if not feeder.strip() or not meter.strip():
                     st.error("Feeder name and meter number are required.")
@@ -1825,14 +1825,14 @@ elif page=="Feeder Master":
                                         key=f"ir_{row['id']}",format="%.3f",
                                         help="Baseline used only when no earlier monthly reading exists. Historical Excel imports can update this automatically from the workbook's Last Reading.")
                 save,delete=st.columns(2)
-                if save.form_submit_button("Save changes",type="primary",use_container_width=True):
+                if save.form_submit_button("Save changes",type="primary",width="stretch"):
                     try:
                         update_feeder(con,row["id"],feeder,meter,mf,LABEL_TO_TYPE[typ],initial,division,None if subdivision_label=="None" else subdivision_label,voltage,energy_direction)
                         st.success("Feeder updated.")
                         st.rerun()
                     except sqlite3.IntegrityError:
                         st.error("This meter number already exists for that selection.")
-                if delete.form_submit_button("Delete feeder",use_container_width=True):
+                if delete.form_submit_button("Delete feeder",width="stretch"):
                     delete_feeder(con,row["id"])
                     st.success("Feeder deleted.")
                     st.rerun()
@@ -1853,7 +1853,7 @@ elif page=="Generate Excel":
     if pending:
         st.warning("Some mapped feeders do not have a reading for this month. The generated workbook will show those readings as blank.")
 
-    if st.button("Build exact Excel workbook",type="primary",use_container_width=True):
+    if st.button("Build exact Excel workbook",type="primary",width="stretch"):
         if scope=="Circle":
             data=build_report(con,year,month)
             filename=f"MU Inj. {calendar.month_name[month]}, {year}.xlsx"
@@ -1863,7 +1863,7 @@ elif page=="Generate Excel":
         st.download_button(
             "⬇ Download Excel",data=data,file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            width="stretch"
         )
         st.success("Report generated from the supplied Excel template.")
 
@@ -1897,7 +1897,7 @@ elif page=="Import Excel":
 
     if uploaded is not None:
         st.write(f"**Selected:** {uploaded.name}")
-        if st.button("Import this month into database",type="primary",use_container_width=True):
+        if st.button("Import this month into database",type="primary",width="stretch"):
             try:
                 if scope=="Circle":
                     result=import_month_excel(
@@ -1963,7 +1963,7 @@ else:
             "Section":["A — Import from GSS","B — Import from other circle","C — Export to other circle","NET"],
             "Readings entered":[counts["A"],counts["B"],counts["C"],sum(counts.values())],
             "Energy (MU)":[totals["A"],totals["B"],totals["C"],net]
-        },use_container_width=True,hide_index=True)
+        },width="stretch",hide_index=True)
 
         st.divider()
         st.subheader("Energy Trend — Last 5 Months")
@@ -1981,8 +1981,8 @@ else:
             y,m=previous_period(y,m)
         trend.reverse()
         trend_df=pd.DataFrame(trend).set_index("Month")
-        st.line_chart(trend_df,use_container_width=True)
-        st.dataframe(trend_df.reset_index(),use_container_width=True,hide_index=True)
+        st.line_chart(trend_df,width="stretch")
+        st.dataframe(trend_df.reset_index(),width="stretch",hide_index=True)
 
     else:
         totals=division_energy_summary(con,year,month,division_name)
@@ -1998,7 +1998,7 @@ else:
         st.dataframe({
             "Flow":["Import","Export","NET"],
             "Energy (MWh)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]
-        },use_container_width=True,hide_index=True)
+        },width="stretch",hide_index=True)
 
         st.divider()
         st.subheader("Energy Trend — Last 5 Months")
@@ -2015,6 +2015,5 @@ else:
             y,m=previous_period(y,m)
         trend.reverse()
         trend_df=pd.DataFrame(trend).set_index("Month")
-        st.line_chart(trend_df,use_container_width=True)
-        st.dataframe(trend_df.reset_index(),use_container_width=True,hide_index=True)
-
+        st.line_chart(trend_df,width="stretch")
+        st.dataframe(trend_df.reset_index(),width="stretch",hide_index=True)
