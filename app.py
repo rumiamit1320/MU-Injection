@@ -1584,168 +1584,178 @@ def _report_rows_with_meter_continuity(con, year, month, sec):
 
 
 def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_reading=None):
-    """Add one feeder to the selected month's MU report section.
+    """Add a feeder to the selected month's MU report section.
 
-    If the same feeder already exists in another monthly report section, keep
-    that original record untouched and create a separate feeder-master record
-    for the new section. The duplicate keeps the same meter/MF and uses an
-    explicit Import/Export name suffix so it can have its own monthly reading
-    history.
+    If the feeder already belongs to another A/B/C section for this month,
+    preserve that record and create a separate feeder-master record for the
+    requested section. The duplicate uses the same meter/MF and an explicit
+    Import/Export suffix, then receives its own monthly template row.
     """
-    row = con.execute(
+    source = con.execute(
         "SELECT * FROM feeder_master WHERE id=? AND active=1 LIMIT 1",
         (feeder_id,)
     ).fetchone()
-    if row is None:
+    if source is None:
         return False, "Feeder is not present in the active Feeder Master."
 
-    existing = con.execute(
+    existing_source = con.execute(
         """SELECT * FROM monthly_readings
            WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
         (feeder_id, year, month)
     ).fetchone()
 
-    if existing is not None:
-        existing_section = existing["report_section"]
-        if existing_section == section:
+    if existing_source is not None and existing_source["report_section"] == section:
+        return False, (
+            f"{source['feeder_name']} is already present in Section {section} "
+            "for this month. No change was made."
+        )
+
+    # If this feeder is already represented in another A/B/C section, create
+    # a distinct master record for the second direction instead of moving it.
+    if existing_source is not None and existing_source["report_section"] in ("A", "B", "C"):
+        if initial_reading is None:
+            direction_name = "Export" if section == "C" else "Import"
             return False, (
-                f"{row['feeder_name']} is already present in Section {section} "
-                "for this month. No change was made."
+                f"{source['feeder_name']} is already configured in Section "
+                f"{existing_source['report_section']} for this month. Enter the "
+                f"initial reading to create a separate {direction_name} record."
             )
 
-        if existing_section in ("A", "B", "C"):
-            if initial_reading is None:
-                return False, (
-                    f"{row['feeder_name']} is already configured in Section "
-                    f"{existing_section} for this month. Enter the initial "
-                    f"reading to create a separate {('Export' if section == 'C' else 'Import')} "
-                    "record in this section."
-                )
+        target_entry_type = section
+        target_selection = TYPE_LABELS[section]
+        target_direction = "EXPORT" if section == "C" else "IMPORT"
+        suffix = "Export" if section == "C" else "Import"
 
-            target_entry_type = section
-            target_selection = TYPE_LABELS[section]
-            target_direction = "EXPORT" if section == "C" else "IMPORT"
-            suffix = "Export" if section == "C" else "Import"
+        # Only reuse an existing target-direction record when it is this same
+        # feeder. Otherwise the meter/entry-type uniqueness means the target
+        # direction is already represented by another master record.
+        duplicate = con.execute(
+            """SELECT * FROM feeder_master
+               WHERE meter_no=? AND entry_type=? AND active=1
+               LIMIT 1""",
+            (source["meter_no"], target_entry_type)
+        ).fetchone()
 
-            # A feeder/meter may legitimately exist once for import and once
-            # for export. Reuse an already-created target record if one exists.
+        if duplicate is None:
+            duplicate_name = f"{source['feeder_name']} ({suffix})"
+            add_feeder(
+                con,
+                duplicate_name,
+                source["meter_no"],
+                source["mf"],
+                target_entry_type,
+                float(initial_reading),
+                source["division_name"],
+                source["subdivision"],
+                source["voltage_kv"],
+                target_direction,
+                target_selection,
+            )
             duplicate = con.execute(
                 """SELECT * FROM feeder_master
                    WHERE meter_no=? AND entry_type=? AND active=1
                    LIMIT 1""",
-                (row["meter_no"], target_entry_type)
+                (source["meter_no"], target_entry_type)
             ).fetchone()
-
-            if duplicate is None:
-                duplicate_name = f"{row['feeder_name']} ({suffix})"
-                try:
-                    add_feeder(
-                        con,
-                        duplicate_name,
-                        row["meter_no"],
-                        row["mf"],
-                        target_entry_type,
-                        float(initial_reading),
-                        row["division_name"],
-                        row["subdivision"],
-                        row["voltage_kv"],
-                        target_direction,
-                        target_selection,
-                    )
-                except (sqlite3.IntegrityError, ValueError):
-                    duplicate = con.execute(
-                        """SELECT * FROM feeder_master
-                           WHERE meter_no=? AND entry_type=? AND active=1
-                           LIMIT 1""",
-                        (row["meter_no"], target_entry_type)
-                    ).fetchone()
-                    if duplicate is None:
-                        raise
-                duplicate = con.execute(
-                    """SELECT * FROM feeder_master
-                       WHERE meter_no=? AND entry_type=? AND active=1
-                       LIMIT 1""",
-                    (row["meter_no"], target_entry_type)
-                ).fetchone()
-            else:
-                con.execute(
-                    """UPDATE feeder_master
-                       SET initial_reading_kwh=?,
-                           division_name=?,
-                           subdivision=?,
-                           voltage_kv=?,
-                           energy_direction=?,
-                           selection_type=?,
-                           updated_at=CURRENT_TIMESTAMP
-                       WHERE id=?""",
-                    (
-                        float(initial_reading),
-                        row["division_name"],
-                        row["subdivision"],
-                        row["voltage_kv"],
-                        target_direction,
-                        target_selection,
-                        duplicate["id"],
-                    )
-                )
-                con.commit()
-                duplicate = con.execute(
-                    "SELECT * FROM feeder_master WHERE id=? LIMIT 1",
-                    (duplicate["id"],)
-                ).fetchone()
-
-            feeder_id = duplicate["id"]
-            row = duplicate
-            existing = con.execute(
-                """SELECT * FROM monthly_readings
-                   WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
-                (feeder_id, year, month)
-            ).fetchone()
-
-            # The newly-created duplicate must have its own monthly row so it
-            # immediately appears in the MU Template, Excel preview and
-            # Enter Readings page.
-            if existing is None:
-                pass
         else:
+            # If an earlier attempt created the target-direction master but
+            # did not create its monthly row, complete that record now.
+            if not str(duplicate["feeder_name"]).strip().endswith(f"({suffix})"):
+                return False, (
+                    f"Meter {source['meter_no']} is already assigned to another "
+                    f"feeder master record for {target_selection}. No existing "
+                    "feeder was changed."
+                )
+            con.execute(
+                """UPDATE feeder_master
+                   SET initial_reading_kwh=?,
+                       division_name=?,
+                       subdivision=?,
+                       voltage_kv=?,
+                       energy_direction=?,
+                       selection_type=?,
+                       updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (
+                    float(initial_reading),
+                    source["division_name"],
+                    source["subdivision"],
+                    source["voltage_kv"],
+                    target_direction,
+                    target_selection,
+                    duplicate["id"],
+                )
+            )
+            con.commit()
+            duplicate = con.execute(
+                "SELECT * FROM feeder_master WHERE id=? LIMIT 1",
+                (duplicate["id"],)
+            ).fetchone()
+
+        target_id = duplicate["id"]
+
+        target_monthly = con.execute(
+            """SELECT * FROM monthly_readings
+               WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
+            (target_id, year, month)
+        ).fetchone()
+
+        if target_monthly is not None:
+            if target_monthly["report_section"] == section:
+                return False, (
+                    f"{duplicate['feeder_name']} is already present in Section "
+                    f"{section} for this month. No change was made."
+                )
             return False, (
-                f"{row['feeder_name']} already has a monthly record for this "
-                "period that cannot be reassigned."
+                f"{duplicate['feeder_name']} already has a monthly report row "
+                f"in Section {target_monthly['report_section']}. No existing "
+                "section was changed."
             )
 
+        row = duplicate
+        feeder_id = target_id
+        existing_source = None
+    else:
+        row = source
+
     max_row = con.execute(
-        "SELECT COALESCE(MAX(report_order),0) AS max_order FROM monthly_readings "
-        "WHERE year=? AND month=? AND report_section=?",
+        """SELECT COALESCE(MAX(report_order),0) AS max_order
+           FROM monthly_readings
+           WHERE year=? AND month=? AND report_section=?""",
         (year, month, section)
     ).fetchone()
     next_order = int(max_row["max_order"] or 0) + 1
 
-    if existing is None:
-        con.execute(
-            """INSERT INTO monthly_readings
-               (feeder_id,year,month,reading_kwh,remarks,report_section,report_order,
-                report_feeder_name,report_meter_no,report_mf,report_sl_no)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                feeder_id, year, month, 0.0,
-                "Added from MU Template — pending reading",
-                section, next_order,
-                row["feeder_name"], row["meter_no"], float(row["mf"]), next_order
-            )
+    con.execute(
+        """INSERT INTO monthly_readings
+           (feeder_id,year,month,reading_kwh,remarks,report_section,report_order,
+            report_feeder_name,report_meter_no,report_mf,report_sl_no,
+            last_reading_kwh)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            feeder_id, year, month, 0.0,
+            "Added from MU Template — pending reading",
+            section, next_order,
+            row["feeder_name"], row["meter_no"], float(row["mf"]), next_order,
+            float(initial_reading) if existing_source is None and initial_reading is not None else None,
         )
-    else:
-        # Existing records already in another section are never moved. This
-        # branch is only for an existing target duplicate.
-        if existing["report_section"] == section:
-            return False, f"{row['feeder_name']} is already present in Section {section} for this month. No change was made."
-        return False, (
-            f"{row['feeder_name']} already has a monthly record for this "
-            "period. No existing section was changed."
-        )
-
+    )
     con.commit()
-    return True, row["feeder_name"]
 
+    # Re-read the inserted row so all subsequent UI queries see the committed
+    # monthly template record immediately after Streamlit reruns.
+    verify = con.execute(
+        """SELECT r.id
+           FROM monthly_readings r
+           WHERE r.feeder_id=? AND r.year=? AND r.month=?
+             AND r.report_section=?
+           LIMIT 1""",
+        (feeder_id, year, month, section)
+    ).fetchone()
+    if verify is None:
+        return False, "The feeder master was created, but the monthly MU Template row could not be created."
+
+    return True, row["feeder_name"]
 
 def ensure_mu_template_for_month(con, year, month):
     """Seed a new month from the current MU Template. Once monthly report rows
