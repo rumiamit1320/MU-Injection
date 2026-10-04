@@ -947,27 +947,31 @@ def division_energy_summary(con,year,month,division_name):
     if div_id is None:
         totals["NET"]=0.0
         return totals
-    maps=con.execute("""SELECT m.*,f.mf,r.reading_kwh AS master_reading,r.direct_mu AS master_direct_mu,
-                               dr.reading_kwh AS row_reading
+    maps=con.execute("""SELECT m.*,f.mf AS master_mf,
+                               dr.reading_kwh AS row_reading,
+                               dr.last_reading_kwh AS row_last_reading,
+                               dr.mf AS row_mf
                         FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
-                        LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
-                        LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
+                        LEFT JOIN division_row_readings dr
+                          ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
                         WHERE m.division_id=? AND m.active=1
                         ORDER BY m.sheet_row,m.id""",
-                     (year,month,year,month,div_id)).fetchall()
+                     (year,month,div_id)).fetchall()
     for row in maps:
         present=row["row_reading"]
         if present is None:
             continue
-        if row["master_direct_mu"] is not None:
-            mu=abs(float(row["master_direct_mu"]))
-        else:
+        prev=row["row_last_reading"]
+        if prev is None:
             prev=get_previous_division_reading(con,row["id"],row["feeder_id"],year,month,row["baseline_reading_kwh"])
-            if prev is None: continue
-            mu=abs((float(present)-float(prev))*float(row["mf"])/1000.0)
+        if prev is None:
+            continue
+        mf=row["row_mf"] if row["row_mf"] is not None else row["master_mf"]
+        mu=abs((float(present)-float(prev))*float(mf or 1.0)/1000.0)
         totals["EXPORT" if row["flow_direction"]=="EXPORT" else "IMPORT"]+=mu
     totals["NET"]=totals["IMPORT"]-totals["EXPORT"]
     return totals
+
 
 def insert_rows_preserve_merges(ws, idx, amount, copy_from):
     ranges=[]
