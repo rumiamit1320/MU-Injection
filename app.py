@@ -907,21 +907,13 @@ def import_all_division_workbook(con, uploaded_bytes, year, month, overwrite=Fal
 
 
 def bootstrap_division_template(con):
-    div_path = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
-    if not div_path.exists():
-        return
-    ensure_division_master(con)
+    # The July workbook is a structure reference only. Its readings are never
+    # imported into a calendar month.
     try:
-        data = div_path.read_bytes()
-        for division_name in DIVISIONS:
-            n = con.execute(
-                "SELECT COUNT(*) n FROM division_row_map WHERE division_id=?",
-                (DIVISION_TO_ID[division_name],)
-            ).fetchone()["n"]
-            if n == 0:
-                import_division_workbook(con, data, 2026, 6, division_name, False)
+        ensure_division_template_reference(con)
     except Exception:
         pass
+
 
 
 def get_division_id(con, division_name):
