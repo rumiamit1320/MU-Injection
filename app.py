@@ -2410,16 +2410,23 @@ elif page=="MU Template":
                         )
                 continue
 
-            # A/B/C are the actual monthly MU report sections.
+            # A/B/C show the actual current monthly template. These rows are
+            # seeded from the master template for a new month and remain unchanged
+            # when the user edits the monthly template.
             classification_rows = con.execute(
-                """SELECT feeder_name, meter_no, mf, division_name, subdivision
-                   FROM feeder_master
-                   WHERE active=1 AND selection_type=?
-                   ORDER BY feeder_name, meter_no""",
-                (label,)
+                """SELECT r.report_feeder_name AS feeder_name,
+                          r.report_meter_no AS meter_no,
+                          r.report_mf AS mf,
+                          f.division_name, f.subdivision
+                   FROM monthly_readings r
+                   JOIN feeder_master f ON f.id=r.feeder_id
+                   WHERE r.year=? AND r.month=? AND r.report_section=?
+                     AND r.report_meter_no NOT LIKE '__DIRECT_MU__%'
+                   ORDER BY r.report_order, r.id""",
+                (year, month, sec)
             ).fetchall()
 
-            st.caption("Current Feeder Master classification")
+            st.caption("Current monthly MU Template")
             if classification_rows:
                 st.dataframe(
                     [
