@@ -523,23 +523,44 @@ def preferred_entry_type_for_flow(flow):
     return "C" if flow == "EXPORT" else "A"
 
 
+def _directional_master_name(feeder_name, entry_type):
+    """Give the same meter a distinct master name when it exists in both
+    import and export directions. Report/Excel source names remain unchanged.
+    """
+    base = str(feeder_name or "").strip()
+    suffix = "_export" if entry_type == "C" else "_import"
+    if base.lower().endswith(suffix):
+        return base
+    opposite = "_import" if entry_type == "C" else "_export"
+    if base.lower().endswith(opposite):
+        base = base[: -len(opposite)].rstrip()
+    return f"{base}{suffix}"
+
+
 def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="A", year=None, month=None, present=None, division_name=None, subdivision=None, voltage_kv=None, energy_direction=None):
     meter_no = str(meter_no).strip()
     feeder_name = str(feeder_name).strip()
-    exact = con.execute(
-        "SELECT * FROM feeder_master WHERE meter_no=? AND entry_type=? ORDER BY id LIMIT 1",
-        (meter_no, preferred_type)
-    ).fetchone()
-    if exact is not None:
-        con.execute(
-            "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (feeder_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"), exact["id"])
-        )
-        return exact["id"], False
 
     candidates = con.execute(
         "SELECT * FROM feeder_master WHERE meter_no=? ORDER BY id", (meter_no,)
     ).fetchall()
+
+    exact = con.execute(
+        "SELECT * FROM feeder_master WHERE meter_no=? AND entry_type=? ORDER BY id LIMIT 1",
+        (meter_no, preferred_type)
+    ).fetchone()
+
+    master_name = feeder_name
+    if candidates and any(row["entry_type"] != preferred_type for row in candidates):
+        master_name = _directional_master_name(feeder_name, preferred_type)
+
+    if exact is not None:
+        con.execute(
+            "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (master_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"), exact["id"])
+        )
+        return exact["id"], False
+
     if candidates:
         priority = {"C": ["C","B","A"], "A": ["B","A","C"], "B": ["B","A","C"]}.get(
             preferred_type, [preferred_type,"B","A","C"]
@@ -548,9 +569,6 @@ def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="
             candidates,
             key=lambda x: (priority.index(x["entry_type"]) if x["entry_type"] in priority else 99, x["id"])
         )
-        # Division workbooks occasionally show the same meter number twice with
-        # different present readings. If a matching monthly reading already
-        # exists, bind the division row to that meter instance.
         if year is not None and month is not None and present is not None:
             matching = []
             for candidate in candidates:
@@ -568,18 +586,18 @@ def find_or_create_meter_master(con, feeder_name, meter_no, mf, preferred_type="
 
         chosen = ordered[0]
         fid = chosen["id"]
+        chosen_name = master_name if chosen["entry_type"] == preferred_type else _directional_master_name(feeder_name, chosen["entry_type"])
         con.execute(
             "UPDATE feeder_master SET feeder_name=?, mf=?, division_name=COALESCE(division_name,?), subdivision=COALESCE(subdivision,?), voltage_kv=COALESCE(voltage_kv,?), energy_direction=COALESCE(?,energy_direction), updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (feeder_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"), fid)
+            (chosen_name, float(mf), division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if chosen["entry_type"]=="C" else "IMPORT"), fid)
         )
         return fid, False
 
     con.execute(
         "INSERT INTO feeder_master (feeder_name,meter_no,mf,entry_type,initial_reading_kwh,division_name,subdivision,voltage_kv,energy_direction) VALUES(?,?,?,?,0,?,?,?,?)",
-        (feeder_name, meter_no, float(mf), preferred_type, division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"))
+        (master_name, meter_no, float(mf), preferred_type, division_name, subdivision, voltage_kv, energy_direction or ("EXPORT" if preferred_type=="C" else "IMPORT"))
     )
     return con.execute("SELECT last_insert_rowid() AS id").fetchone()["id"], True
-
 
 def ensure_division_master(con):
     for name, sheet in DIVISIONS.items():
@@ -1624,7 +1642,7 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_read
         target_entry_type = section
         target_selection = TYPE_LABELS[section]
         target_direction = "EXPORT" if section == "C" else "IMPORT"
-        suffix = "Export" if section == "C" else "Import"
+        suffix = "export" if section == "C" else "import"
 
         # Only reuse an existing target-direction record when it is this same
         # feeder. Otherwise the meter/entry-type uniqueness means the target
@@ -1637,7 +1655,7 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_read
         ).fetchone()
 
         if duplicate is None:
-            duplicate_name = f"{source['feeder_name']} ({suffix})"
+            duplicate_name = f"{source['feeder_name']}_{suffix}"
             add_feeder(
                 con,
                 duplicate_name,
@@ -1669,14 +1687,14 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_read
                     """UPDATE feeder_master
                        SET feeder_name=?
                        WHERE id=?""",
-                    (f"{source['feeder_name']} ({suffix})", duplicate["id"])
+                    (f"{source['feeder_name']}_{suffix}", duplicate["id"])
                 )
                 con.commit()
                 duplicate = con.execute(
                     "SELECT * FROM feeder_master WHERE id=? LIMIT 1",
                     (duplicate["id"],)
                 ).fetchone()
-            elif not existing_name.endswith(f"({suffix})"):
+            elif not existing_name.lower().endswith(f"_{suffix}"):
                 return False, (
                     f"Meter {source['meter_no']} is already assigned to another "
                     f"feeder master record for {target_selection}. No existing "
@@ -2201,6 +2219,11 @@ if page=="Enter Readings":
     scope_label = CIRCLE_NAME if scope=="Circle" else division_name
     st.subheader(f"Enter Readings — {scope_label} — {calendar.month_name[month]} {year}")
     st.caption("Monthly readings are shared between circle and division views for the same meter master.")
+    reading_search = st.text_input(
+        "Search feeder readings",
+        placeholder="Search by feeder name or meter number…",
+        key=f"enter_readings_search_{scope}_{year}_{month}",
+    ).strip().casefold()
     if scope=="Circle":
             st.subheader(f"Enter Readings — {calendar.month_name[month]} {year}")
             st.caption("Only feeders without a reading for the selected month are shown. Enter the meter reading in kWh and save each row.")
@@ -2217,6 +2240,13 @@ if page=="Enter Readings":
                         WHERE f.active=1 AND f.entry_type=?
                         ORDER BY f.feeder_name,f.meter_no
                     """,(year,month,sec)).fetchall()
+
+                    if reading_search:
+                        all_rows=[
+                            r for r in all_rows
+                            if reading_search in str(r["feeder_name"] or "").casefold()
+                            or reading_search in str(r["meter_no"] or "").casefold()
+                        ]
 
                     pending=[r for r in all_rows if r["reading_id"] is None or _is_mu_template_pending(r)]
                     done=len(all_rows)-len(pending)
@@ -2251,6 +2281,12 @@ if page=="Enter Readings":
 
     else:
         rows=get_scope_rows(con,year,month,"Division",division_name)
+        if reading_search:
+            rows=[
+                r for r in rows
+                if reading_search in str(r["feeder_name"] or "").casefold()
+                or reading_search in str(r["meter_no"] or "").casefold()
+            ]
         pending=[r for r in rows if r["reading_id"] is None or _is_mu_template_pending(r)]
         done=len(rows)-len(pending)
         st.info(f"{len(pending)} pending · {done} already entered")
@@ -2458,9 +2494,8 @@ elif page=="Feeder Master":
 elif page=="MU Template":
     st.subheader(f"MU Template — {calendar.month_name[month]} {year}")
     st.caption(
-        "Verify the current feeder template by classification. "
-        "Feeder name and meter number are shown directly from Feeder Master. "
-        "Use Search Feeder Master to add an existing feeder to the selected monthly report section."
+        "Verify the current monthly feeder template by classification. "
+        "Feeder additions and classification changes are managed from Feeder Master."
     )
 
     template_sections = [
@@ -2502,56 +2537,8 @@ elif page=="MU Template":
                     )
                 else:
                     st.info("No feeders are currently configured as Open Access in the template.")
-
-                st.divider()
-                st.markdown("**Search Feeder Master**")
-                oa_search = st.text_input(
-                    "Search feeder or meter number",
-                    placeholder="Search by feeder name or meter number…",
-                    key=f"mu_template_search_OA_{year}_{month}",
-                ).strip()
-                if oa_search:
-                    needle = oa_search.casefold()
-                    matches = [
-                        r for r in get_feeders(con, active_only=True)
-                        if needle in str(r["feeder_name"] or "").casefold()
-                        or needle in str(r["meter_no"] or "").casefold()
-                    ]
-                    if not matches:
-                        st.warning(
-                            "No matching feeder was found in Feeder Master. "
-                            "Add the feeder in Feeder Master first, then return here."
-                        )
-                        if st.button(
-                            "Open Feeder Master",
-                            key=f"mu_template_open_master_OA_{year}_{month}",
-                            width="stretch",
-                        ):
-                            st.session_state["selected_page"] = "Feeder Master"
-                            st.rerun()
-                    else:
-                        st.info(
-                            "The feeder exists in Feeder Master. To classify it as Open Access, "
-                            "set Selection = Open Access in Feeder Master."
-                        )
-                        st.dataframe(
-                            [
-                                {
-                                    "Feeder Name": r["feeder_name"],
-                                    "Meter No.": r["meter_no"],
-                                    "MF": r["mf"],
-                                    "Current Selection": selection_label_for_row(r),
-                                }
-                                for r in matches
-                            ],
-                            width="stretch",
-                            hide_index=True,
-                        )
                 continue
 
-            # A/B/C show the actual current monthly template. These rows are
-            # seeded from the master template for a new month and remain unchanged
-            # when the user edits the monthly template.
             classification_rows = con.execute(
                 """SELECT r.report_feeder_name AS feeder_name,
                           r.report_meter_no AS meter_no,
@@ -2583,105 +2570,6 @@ elif page=="MU Template":
                 )
             else:
                 st.info(f"No feeders are currently configured in the {label} template section.")
-
-            st.divider()
-            st.markdown("**Add feeder to this month's report section**")
-            st.caption(
-                "Search the Feeder Master database. The feeder must already exist in Feeder Master."
-            )
-
-            search = st.text_input(
-                "Search feeder or meter number",
-                placeholder="Search by feeder name or meter number…",
-                key=f"mu_template_search_{sec}_{year}_{month}",
-            ).strip()
-
-            if search:
-                needle = search.casefold()
-                matches = [
-                    r for r in get_feeders(con, active_only=True)
-                    if needle in str(r["feeder_name"] or "").casefold()
-                    or needle in str(r["meter_no"] or "").casefold()
-                ]
-
-                if not matches:
-                    st.warning(
-                        "No matching feeder was found in Feeder Master. "
-                        "Add the feeder in Feeder Master first, then return here."
-                    )
-                    if st.button(
-                        "Open Feeder Master",
-                        key=f"mu_template_open_master_{sec}_{year}_{month}",
-                        width="stretch",
-                    ):
-                        st.session_state["selected_page"] = "Feeder Master"
-                        st.rerun()
-                else:
-                    options = [
-                        f"{r['feeder_name']}  |  {r['meter_no']}  |  MF: {r['mf']}"
-                        for r in matches
-                    ]
-                    selected = st.selectbox(
-                        "Select feeder",
-                        options,
-                        key=f"mu_template_select_{sec}_{year}_{month}",
-                    )
-                    selected_row = matches[options.index(selected)]
-
-                    already = con.execute(
-                        """SELECT report_section FROM monthly_readings
-                           WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
-                        (selected_row["id"], year, month)
-                    ).fetchone()
-
-                    initial_reading = None
-                    if already is not None and already["report_section"] == sec:
-                        st.info("This feeder is already present in this section for the selected month.")
-                    elif already is not None and already["report_section"] in ("A", "B", "C"):
-                        old_sec = already["report_section"]
-                        st.info(
-                            f"This feeder is already configured in Section {old_sec} for this month. "
-                            f"It will remain in Section {old_sec}; it will not be removed or moved. "
-                            "If you want the same feeder in this second section, a separate "
-                            "Import/Export feeder record will be created."
-                        )
-                        initial_reading = st.number_input(
-                            "Initial reading for the new section (kWh)",
-                            min_value=0.0,
-                            value=None,
-                            format="%.3f",
-                            key=f"mu_template_initial_{sec}_{year}_{month}_{selected_row['id']}",
-                            help="Enter the present baseline reading of the meter for this new Import/Export record.",
-                        )
-
-                    if st.button(
-                        f"Add to {label}",
-                        key=f"mu_template_add_{sec}_{year}_{month}_{selected_row['id']}",
-                        type="primary",
-                        width="stretch",
-                    ):
-                        needs_initial = (
-                            initial_reading is None
-                            and already is not None
-                            and already["report_section"] in ("A", "B", "C")
-                            and already["report_section"] != sec
-                        )
-                        if needs_initial:
-                            st.error("Initial reading is required before adding this feeder to the second section.")
-                        else:
-                            ok, message = add_feeder_to_mu_template(
-                                con,
-                                selected_row["id"],
-                                year,
-                                month,
-                                sec,
-                                initial_reading=initial_reading,
-                            )
-                            if ok:
-                                st.success(f"{message} added to {label}.")
-                                st.rerun()
-                            else:
-                                st.error(message)
 
             report_rows = con.execute(
                 """SELECT r.report_sl_no, r.report_feeder_name, r.report_meter_no,
