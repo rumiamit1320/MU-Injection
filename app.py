@@ -2622,7 +2622,7 @@ elif page=="MU Template":
                         initial_reading = st.number_input(
                             "Initial reading for the new section (kWh)",
                             min_value=0.0,
-                            value=0.0,
+                            value=None,
                             format="%.3f",
                             key=f"mu_template_initial_{sec}_{year}_{month}_{selected_row['id']}",
                             help="Enter the present baseline reading of the meter for this new Import/Export record.",
@@ -2642,11 +2642,22 @@ elif page=="MU Template":
                             sec,
                             initial_reading=initial_reading,
                         )
-                        if ok:
-                            st.success(f"{message} added to {label}.")
-                            st.rerun()
+                        if initial_reading is None and already is not None and already["report_section"] in ("A", "B", "C") and already["report_section"] != sec:
+                            st.error("Initial reading is required before adding this feeder to the second section.")
                         else:
-                            st.error(message)
+                            ok, message = add_feeder_to_mu_template(
+                                con,
+                                selected_row["id"],
+                                year,
+                                month,
+                                sec,
+                                initial_reading=initial_reading,
+                            )
+                            if ok:
+                                st.success(f"{message} added to {label}.")
+                                st.rerun()
+                            else:
+                                st.error(message)
 
             report_rows = con.execute(
                 """SELECT r.report_sl_no, r.report_feeder_name, r.report_meter_no,
