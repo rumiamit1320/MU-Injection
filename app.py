@@ -1874,7 +1874,7 @@ elif page=="Feeder Master":
             subdivision_label=c5.selectbox("Subdivision",sub_labels,key="new_subdivision")
             typ_label=c6.selectbox("Selection",SELECTION_OPTIONS,key="new_selection")
             c7,c8,c9=st.columns([1.3,1.3,2.0])
-            energy_direction=c7.selectbox("Energy Direction",["IMPORT","EXPORT"],index=0 if LABEL_TO_TYPE[typ_label] != "C" else 1,key="new_energy_direction",help="For division reports: IMPORT is added to net injection; EXPORT is subtracted.")
+            energy_direction=c7.selectbox("Energy Direction",["IMPORT","EXPORT"],index=0 if SELECTION_TO_ENTRY_TYPE[typ_label] != "C" else 1,key="new_energy_direction",help="For division reports: IMPORT is added to net injection; EXPORT is subtracted.")
             voltage=c8.number_input("Voltage (kV)",min_value=0.0,value=33.0,step=1.0)
             initial=c9.number_input("Initial reading (kWh)",min_value=0.0,value=0.0,format="%.3f",help="Baseline used only when no earlier monthly reading exists. When a historical Excel month is imported, its Last Reading is used automatically as this baseline.")
             submit=st.form_submit_button("Save new feeder",type="primary",width="stretch")
