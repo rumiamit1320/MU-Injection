@@ -1818,10 +1818,19 @@ def style():
 
 st.set_page_config(page_title="MU Injection Manager", page_icon="⚡", layout="wide")
 style()
-con=db()
-# Authentication schema must exist before the login screen queries app_users.
-# This is intentionally kept separate from db() so existing databases are not rebuilt.
-ensure_auth_table(con)
+
+try:
+    con=db()
+    # Authentication schema must exist before the login screen queries app_users.
+    # This is intentionally kept separate from db() so existing databases are not rebuilt.
+    ensure_auth_table(con)
+except Exception:
+    st.session_state.pop("_postgres_db_connection", None)
+    st.error("The MU Injection Manager service is waking up. Please wait a few seconds and retry.", icon=":material/cloud_sync:")
+    st.info("No data has been changed. The service is recovering its connection.")
+    if st.button("Retry connection", type="primary", width="stretch", key="retry_service_connection"):
+        st.rerun()
+    st.stop()
 
 if not render_login(con):
     st.stop()
