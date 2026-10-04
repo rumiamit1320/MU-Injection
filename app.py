@@ -1634,6 +1634,53 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section):
     con.commit()
     return True, row["feeder_name"]
 
+
+def ensure_mu_template_for_month(con, year, month):
+    """Seed a new month from the current MU Template. Once monthly report rows
+    exist, those month-specific rows are authoritative until the template is edited.
+    """
+    existing = con.execute(
+        """SELECT 1 FROM monthly_readings
+           WHERE year=? AND month=? AND report_section IN ('A','B','C') LIMIT 1""",
+        (year, month)
+    ).fetchone()
+    if existing is not None:
+        return
+
+    rows = con.execute(
+        """SELECT * FROM feeder_master
+           WHERE active=1
+             AND selection_type IN ('Import from GSS','Import from other circle','Export to other circle')
+             AND meter_no NOT LIKE '__DIRECT_MU__%'
+           ORDER BY CASE selection_type
+             WHEN 'Import from GSS' THEN 1
+             WHEN 'Import from other circle' THEN 2
+             WHEN 'Export to other circle' THEN 3
+             ELSE 4 END,
+             feeder_name, meter_no"""
+    ).fetchall()
+
+    counters = {"A": 0, "B": 0, "C": 0}
+    for row in rows:
+        sec = LABEL_TO_TYPE.get(row["selection_type"])
+        if sec not in counters:
+            continue
+        counters[sec] += 1
+        con.execute(
+            """INSERT INTO monthly_readings
+               (feeder_id,year,month,reading_kwh,remarks,report_section,report_order,
+                report_feeder_name,report_meter_no,report_mf,report_sl_no)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(feeder_id,year,month) DO NOTHING""",
+            (
+                row["id"], year, month, 0.0,
+                "Added from MU Template — pending reading",
+                sec, counters[sec],
+                row["feeder_name"], row["meter_no"], float(row["mf"]), counters[sec]
+            )
+        )
+    con.commit()
+
 def build_report(con, year, month):
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb["MU inj JEC"]
@@ -1926,6 +1973,8 @@ if not st.session_state.get("_data_bootstrapped", False):
     ensure_division_master(con)
     bootstrap_division_template(con)
     st.session_state["_data_bootstrapped"] = True
+
+ensure_mu_template_for_month(con, year, month)
 
 now=datetime.now()
 default_year=now.year
@@ -2292,6 +2341,7 @@ elif page=="MU Template":
                     """SELECT feeder_name, meter_no, mf, division_name, subdivision
                        FROM feeder_master
                        WHERE active=1 AND selection_type=?
+                         AND meter_no NOT LIKE '__DIRECT_MU__%'
                        ORDER BY feeder_name, meter_no""",
                     ("Open Access",)
                 ).fetchall()
@@ -2312,7 +2362,7 @@ elif page=="MU Template":
                         hide_index=True,
                     )
                 else:
-                    st.info("No feeder is currently classified as Open Access in Feeder Master.")
+                    st.info("No feeders are currently configured as Open Access in the template.")
 
                 st.divider()
                 st.markdown("**Search Feeder Master**")
@@ -2386,7 +2436,7 @@ elif page=="MU Template":
                     hide_index=True,
                 )
             else:
-                st.info(f"No feeder is currently classified as {label} in Feeder Master.")
+                st.info(f"No feeders are currently configured in the {label} template section.")
 
             st.divider()
             st.markdown("**Add feeder to this month's report section**")
@@ -2475,7 +2525,7 @@ elif page=="MU Template":
             st.divider()
             st.markdown("**Current monthly Excel section preview**")
             if not report_rows:
-                st.info("No feeders have been added to this monthly report section yet.")
+                st.info("No feeders are currently configured in this monthly template section.")
             else:
                 preview = []
                 for rr in report_rows:
