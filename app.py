@@ -1563,6 +1563,60 @@ def _report_rows_with_meter_continuity(con, year, month, sec):
     return rows
 
 
+
+def add_feeder_to_mu_template(con, feeder_id, year, month, section):
+    """Add or move one feeder in the selected month's MU report section.
+    This changes only the month-specific report metadata, not feeder-master
+    classification, so historical/current master data remains intact.
+    """
+    row = con.execute("SELECT * FROM feeder_master WHERE id=? AND active=1 LIMIT 1", (feeder_id,)).fetchone()
+    if row is None:
+        return False, "Feeder is not present in the active Feeder Master."
+
+    existing = con.execute(
+        "SELECT * FROM monthly_readings WHERE feeder_id=? AND year=? AND month=? LIMIT 1",
+        (feeder_id, year, month)
+    ).fetchone()
+
+    max_row = con.execute(
+        "SELECT COALESCE(MAX(report_order),0) AS max_order FROM monthly_readings "
+        "WHERE year=? AND month=? AND report_section=?",
+        (year, month, section)
+    ).fetchone()
+    next_order = int(max_row["max_order"] or 0) + 1
+
+    if existing is None:
+        con.execute(
+            """INSERT INTO monthly_readings
+               (feeder_id,year,month,reading_kwh,remarks,report_section,report_order,
+                report_feeder_name,report_meter_no,report_mf,report_sl_no)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                feeder_id, year, month, 0.0,
+                "Added from MU Template",
+                section, next_order,
+                row["feeder_name"], row["meter_no"], float(row["mf"]), None
+            )
+        )
+    else:
+        con.execute(
+            """UPDATE monthly_readings
+               SET report_section=?,
+                   report_order=?,
+                   report_feeder_name=?,
+                   report_meter_no=?,
+                   report_mf=?,
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (
+                section, next_order,
+                row["feeder_name"], row["meter_no"], float(row["mf"]),
+                existing["id"]
+            )
+        )
+    con.commit()
+    return True, row["feeder_name"]
+
 def build_report(con, year, month):
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
     ws = wb["MU inj JEC"]
@@ -1924,6 +1978,7 @@ with st.sidebar:
         "Direct MU Entry",
         "All Feeder Readings",
         "Feeder Master",
+        "MU Template",
         "Generate Excel",
         "Import Excel",
         "Dashboard"
@@ -2191,6 +2246,137 @@ elif page=="Feeder Master":
                     delete_feeder(con,row["id"])
                     st.success("Feeder deleted.")
                     st.rerun()
+
+# ---------- MU TEMPLATE ----------
+elif page=="MU Template":
+    st.subheader(f"MU Template — {calendar.month_name[month]} {year}")
+    st.caption(
+        "This is the report layout used by the generated MU Injection Excel. "
+        "Add an existing Feeder Master feeder to Section A, B or C for this month only."
+    )
+
+    section_labels = {
+        "A": "A — Import from GSS",
+        "B": "B — Import from other circle",
+        "C": "C — Export to other circle",
+    }
+
+    tabs = st.tabs(list(section_labels.values()))
+    for tab, sec in zip(tabs, ["A", "B", "C"]):
+        with tab:
+            st.markdown(f"### {section_labels[sec]}")
+            st.caption(
+                "Excel columns: SL No. · Feeder / Injection Point · Meter No. · "
+                "Last Reading · Present Reading · Difference · MF · MU · Remarks"
+            )
+
+            search_key = f"mu_template_search_{sec}_{year}_{month}"
+            search = st.text_input(
+                "Search Feeder Master",
+                placeholder="Search by feeder name or meter number…",
+                key=search_key,
+            ).strip()
+
+            master_rows = get_feeders(con, active_only=True)
+            if search:
+                needle = search.casefold()
+                matches = [
+                    r for r in master_rows
+                    if needle in str(r["feeder_name"] or "").casefold()
+                    or needle in str(r["meter_no"] or "").casefold()
+                ]
+            else:
+                matches = []
+
+            if search and not matches:
+                st.warning(
+                    "No matching feeder was found in Feeder Master. "
+                    "Add the feeder in Feeder Master first, then return here."
+                )
+                if st.button(
+                    "Open Feeder Master",
+                    key=f"mu_template_open_master_{sec}_{year}_{month}",
+                    width="stretch",
+                ):
+                    st.session_state["selected_page"] = "Feeder Master"
+                    st.rerun()
+            elif matches:
+                options = [
+                    f"{r['feeder_name']}  |  {r['meter_no']}  |  MF: {r['mf']}"
+                    for r in matches
+                ]
+                selected = st.selectbox(
+                    "Select feeder",
+                    options,
+                    key=f"mu_template_select_{sec}_{year}_{month}",
+                )
+                selected_row = matches[options.index(selected)]
+
+                already = con.execute(
+                    """SELECT report_section FROM monthly_readings
+                       WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
+                    (selected_row["id"], year, month)
+                ).fetchone()
+
+                if already is not None and already["report_section"] == sec:
+                    st.info("This feeder is already present in this section for the selected month.")
+                elif already is not None and already["report_section"] in ("A", "B", "C"):
+                    old_sec = already["report_section"]
+                    st.warning(
+                        f"This feeder is currently in Section {old_sec} for this month. "
+                        "Adding it here will move its month-specific report row to this section."
+                    )
+
+                if st.button(
+                    f"Add to {section_labels[sec]}",
+                    key=f"mu_template_add_{sec}_{year}_{month}_{selected_row['id']}",
+                    type="primary",
+                    width="stretch",
+                ):
+                    ok, message = add_feeder_to_mu_template(
+                        con, selected_row["id"], year, month, sec
+                    )
+                    if ok:
+                        st.success(f"{message} added to {section_labels[sec]}.")
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+            report_rows = con.execute(
+                """SELECT r.report_sl_no, r.report_feeder_name, r.report_meter_no,
+                          r.report_mf, r.last_reading_kwh, r.reading_kwh,
+                          r.direct_mu, r.remarks, r.report_order
+                   FROM monthly_readings r
+                   WHERE r.year=? AND r.month=? AND r.report_section=?
+                   ORDER BY r.report_order, r.id""",
+                (year, month, sec)
+            ).fetchall()
+
+            st.divider()
+            st.markdown("**Current Excel section preview**")
+            if not report_rows:
+                st.info("No feeders have been added to this section for the selected month.")
+            else:
+                preview = []
+                for rr in report_rows:
+                    last = rr["last_reading_kwh"]
+                    present = rr["reading_kwh"]
+                    direct_mu = rr["direct_mu"]
+                    mu = direct_mu
+                    if mu is None and last is not None and present is not None:
+                        mu = (float(present) - float(last)) * float(rr["report_mf"] or 1) / 1000.0
+                    preview.append({
+                        "SL No.": rr["report_sl_no"],
+                        "Feeder / Injection Point": rr["report_feeder_name"],
+                        "Meter No.": rr["report_meter_no"],
+                        "Last Reading": last,
+                        "Present Reading": present if present not in (None, 0) else None,
+                        "Difference": None if last is None or present in (None, 0) else float(present) - float(last),
+                        "MF": rr["report_mf"],
+                        "MU": mu,
+                        "Remarks": rr["remarks"],
+                    })
+                st.dataframe(preview, width="stretch", hide_index=True)
 
 # ---------- EXCEL ----------
 elif page=="Generate Excel":
