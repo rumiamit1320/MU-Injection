@@ -1659,8 +1659,24 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_read
             ).fetchone()
         else:
             # If an earlier attempt created the target-direction master but
-            # did not create its monthly row, complete that record now.
-            if not str(duplicate["feeder_name"]).strip().endswith(f"({suffix})"):
+            # did not create its monthly row, complete that record now. When
+            # its name is still exactly the source name, it is the previously
+            # created counterpart for this feeder, so normalize it to the
+            # requested Import/Export name.
+            existing_name = str(duplicate["feeder_name"] or "").strip()
+            if existing_name == str(source["feeder_name"] or "").strip():
+                con.execute(
+                    """UPDATE feeder_master
+                       SET feeder_name=?
+                       WHERE id=?""",
+                    (f"{source['feeder_name']} ({suffix})", duplicate["id"])
+                )
+                con.commit()
+                duplicate = con.execute(
+                    "SELECT * FROM feeder_master WHERE id=? LIMIT 1",
+                    (duplicate["id"],)
+                ).fetchone()
+            elif not existing_name.endswith(f"({suffix})"):
                 return False, (
                     f"Meter {source['meter_no']} is already assigned to another "
                     f"feeder master record for {target_selection}. No existing "
