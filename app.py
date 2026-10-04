@@ -1974,8 +1974,6 @@ if not st.session_state.get("_data_bootstrapped", False):
     bootstrap_division_template(con)
     st.session_state["_data_bootstrapped"] = True
 
-ensure_mu_template_for_month(con, year, month)
-
 now=datetime.now()
 default_year=now.year
 default_month=now.month
@@ -2056,6 +2054,9 @@ with st.sidebar:
                   type="primary" if st.session_state["selected_page"]==page_name else "secondary",
                   on_click=_set_nav_state, args=(page_name,))
     page=st.session_state["selected_page"]
+
+# The selected period is now known; seed a new month from the current MU Template.
+ensure_mu_template_for_month(con, year, month)
 
 # ---------- ENTER READINGS ----------
 if page=="Enter Readings":
