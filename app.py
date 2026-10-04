@@ -1325,15 +1325,29 @@ def get_previous_division_reading(con, division_map_id, feeder_id, year, month, 
     return None
 
 def save_division_reading(con, division_map_id, year, month, reading_kwh, remarks=""):
-    mapping=con.execute("""SELECT feeder_id,baseline_reading_kwh FROM division_row_map
-                           WHERE id=? AND active=1 LIMIT 1""",(division_map_id,)).fetchone()
+    mapping=con.execute("""SELECT m.feeder_id,m.baseline_reading_kwh,m.division_id,m.sheet_row,
+                                  m.flow_direction,m.source_meter_no,f.mf,f.feeder_name,f.meter_no,f.voltage_kv,
+                                  t.report_feeder_name,t.report_mf,t.voltage_kv AS template_voltage
+                           FROM division_row_map m
+                           JOIN feeder_master f ON f.id=m.feeder_id
+                           LEFT JOIN division_row_template t
+                             ON t.division_id=m.division_id AND t.sheet_row=m.sheet_row
+                            AND t.flow_direction=m.flow_direction AND t.active=1
+                           WHERE m.id=? AND m.active=1 LIMIT 1""",(division_map_id,)).fetchone()
     if mapping is None: raise ValueError("Division feeder mapping no longer exists.")
     previous=get_previous_division_reading(con,division_map_id,mapping["feeder_id"],year,month,mapping["baseline_reading_kwh"])
-    con.execute("""INSERT INTO division_row_readings(division_map_id,year,month,reading_kwh)
-                   VALUES(?,?,?,?)
+    meter=mapping["meter_no"] or mapping["source_meter_no"]
+    mf=mapping["mf"] if mapping["mf"] is not None else mapping["template_mf"]
+    feeder_name=mapping["template_feeder_name"] or mapping["feeder_name"]
+    voltage=mapping["voltage_kv"] if mapping["voltage_kv"] is not None else mapping["template_voltage"]
+    con.execute("""INSERT INTO division_row_readings
+                   (division_map_id,year,month,reading_kwh,last_reading_kwh,meter_no,mf,feeder_name,voltage_kv)
+                   VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(division_map_id,year,month) DO UPDATE SET
-                     reading_kwh=excluded.reading_kwh,updated_at=CURRENT_TIMESTAMP""",
-                (division_map_id,year,month,float(reading_kwh)))
+                     reading_kwh=excluded.reading_kwh,last_reading_kwh=excluded.last_reading_kwh,
+                     meter_no=excluded.meter_no,mf=excluded.mf,feeder_name=excluded.feeder_name,
+                     voltage_kv=excluded.voltage_kv,updated_at=CURRENT_TIMESTAMP""",
+                (division_map_id,year,month,float(reading_kwh),previous,meter,mf,feeder_name,voltage))
     existing=con.execute("SELECT id,last_reading_kwh FROM monthly_readings WHERE feeder_id=? AND year=? AND month=?",
                          (mapping["feeder_id"],year,month)).fetchone()
     if existing is None:
