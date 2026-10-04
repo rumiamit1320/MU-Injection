@@ -855,8 +855,9 @@ def division_energy_summary(con,year,month,division_name):
                         ORDER BY m.sheet_row,m.id""",
                      (year,month,year,month,div_id)).fetchall()
     for row in maps:
-        present=row["row_reading"] if row["row_reading"] is not None else row["master_reading"]
-        if present is None: continue
+        present=row["row_reading"]
+        if present is None:
+            continue
         if row["master_direct_mu"] is not None:
             mu=abs(float(row["master_direct_mu"]))
         else:
@@ -882,6 +883,23 @@ def insert_rows_preserve_merges(ws, idx, amount, copy_from):
         elif min_row < idx <= max_row:
             max_row += amount
         ws.merge_cells(start_row=min_row,start_column=min_col,end_row=max_row,end_column=max_col)
+
+def division_available_periods(con, division_name, upto_year=None, upto_month=None):
+    """Return months that actually have Division readings uploaded."""
+    div_id=get_division_id(con,division_name)
+    if div_id is None:
+        return []
+    params=[div_id]
+    where="dm.division_id=? AND dm.active=1"
+    if upto_year is not None and upto_month is not None:
+        where += " AND (dr.year < ? OR (dr.year=? AND dr.month<=?))"
+        params.extend([upto_year,upto_year,upto_month])
+    rows=con.execute(f"""SELECT DISTINCT dr.year,dr.month
+                         FROM division_row_readings dr
+                         JOIN division_row_map dm ON dm.id=dr.division_map_id
+                         WHERE {where}
+                         ORDER BY dr.year DESC,dr.month DESC""",tuple(params)).fetchall()
+    return [(int(x["year"]),int(x["month"])) for x in rows]
 
 def division_report(con,year,month,division_name):
     """Generate division workbook in the supplied division format.
@@ -956,7 +974,7 @@ def division_report(con,year,month,division_name):
 
     for rr,rowmaps in sorted(rows_by_row.items()):
         base=rowmaps[0]
-        present=base["row_reading"] if base["row_reading"] is not None else base["master_reading"]
+        present=base["row_reading"]
         flows={x["flow_direction"] for x in rowmaps}
         if not isinstance(ws.cell(rr,2),MergedCell): ws.cell(rr,2).value=base["source_feeder_name"] or base["feeder_name"]
         if not isinstance(ws.cell(rr,3),MergedCell): ws.cell(rr,3).value=base["voltage_kv"]
@@ -2786,44 +2804,74 @@ else:
         st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
 
     else:
-        totals=division_energy_summary(con,year,month,division_name)
-        div_id=get_division_id(con,division_name)
-        entered_row=con.execute("""SELECT COUNT(*) AS n
-                                   FROM division_row_readings dr
-                                   JOIN division_row_map dm ON dm.id=dr.division_map_id
-                                   WHERE dm.division_id=? AND dm.active=1 AND dr.year=? AND dr.month=?""",
-                                (div_id,year,month)).fetchone()
-        entered=int(entered_row["n"] if entered_row is not None else 0)
-        cols=st.columns(4)
-        cols[0].metric("Import",f"{totals['IMPORT']:,.6f} MU")
-        cols[1].metric("Export",f"{totals['EXPORT']:,.6f} MU")
-        cols[2].metric("Net injection",f"{totals['NET']:,.6f} MU")
-        cols[3].metric("Rows entered",entered)
-        st.dataframe({"Flow":["Import","Export","NET"],
-                      "Energy (MU)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]},
-                     width="stretch",hide_index=True)
-        st.divider()
-        st.subheader("Energy Trend — Last 5 Months")
-        trend=[]; y,m=year,month
-        for _ in range(5):
-            t=division_energy_summary(con,y,m,division_name)
-            trend.append({"Month":f"{calendar.month_abbr[m]} {y}","Date":datetime(y,m,1),
-                           "Import (MU)":t["IMPORT"],"Export (MU)":t["EXPORT"],
-                           "Net injection (MU)":t["NET"]})
-            y,m=previous_period(y,m)
-        trend.reverse()
-        trend_df=pd.DataFrame(trend).sort_values("Date").reset_index(drop=True)
-        chart_long=trend_df.melt(id_vars=["Month","Date"],
-                                 value_vars=["Import (MU)","Export (MU)","Net injection (MU)"],
-                                 var_name="Series",value_name="MU")
-        month_order=trend_df["Month"].tolist()
-        chart=alt.Chart(chart_long).mark_line(point=True).encode(
-            x=alt.X("Month:N",sort=month_order,axis=alt.Axis(title=None,labelAngle=0,labelOverlap=False)),
-            y=alt.Y("MU:Q",title="MU"),color=alt.Color("Series:N",title=None),
-            tooltip=[alt.Tooltip("Month:N",title="Month"),
-                     alt.Tooltip("Series:N",title="Series"),
-                     alt.Tooltip("MU:Q",title="MU",format=".6f")]
-        ).properties(height=360)
-        st.altair_chart(chart,width="stretch")
-        st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
+        available_periods=division_available_periods(con,division_name,year,month)
+        selected_has_data=(year,month) in available_periods
+
+        if not selected_has_data:
+            st.info(
+                f"No Division reading data has been uploaded for "
+                f"{calendar.month_name[month]} {year}. "
+                f"Division data currently available only through the latest uploaded month."
+            )
+            if available_periods:
+                latest_y,latest_m=available_periods[0]
+                st.caption(
+                    f"Latest uploaded Division month: "
+                    f"{calendar.month_name[latest_m]} {latest_y}"
+                )
+        else:
+            totals=division_energy_summary(con,year,month,division_name)
+            div_id=get_division_id(con,division_name)
+            entered_row=con.execute("""SELECT COUNT(*) AS n
+                                       FROM division_row_readings dr
+                                       JOIN division_row_map dm ON dm.id=dr.division_map_id
+                                       WHERE dm.division_id=? AND dm.active=1
+                                         AND dr.year=? AND dr.month=?""",
+                                    (div_id,year,month)).fetchone()
+            entered=int(entered_row["n"] if entered_row is not None else 0)
+
+            cols=st.columns(4)
+            cols[0].metric("Import",f"{totals['IMPORT']:,.6f} MU")
+            cols[1].metric("Export",f"{totals['EXPORT']:,.6f} MU")
+            cols[2].metric("Net injection",f"{totals['NET']:,.6f} MU")
+            cols[3].metric("Rows entered",entered)
+
+            st.dataframe({
+                "Flow":["Import","Export","NET"],
+                "Energy (MU)":[totals["IMPORT"],totals["EXPORT"],totals["NET"]]
+            },width="stretch",hide_index=True)
+
+            st.divider()
+            st.subheader("Energy Trend — Uploaded Months")
+            trend_periods=available_periods[:5]
+            trend=[]
+            for y,m in reversed(trend_periods):
+                t=division_energy_summary(con,y,m,division_name)
+                trend.append({
+                    "Month":f"{calendar.month_abbr[m]} {y}",
+                    "Date":datetime(y,m,1),
+                    "Import (MU)":t["IMPORT"],
+                    "Export (MU)":t["EXPORT"],
+                    "Net injection (MU)":t["NET"]
+                })
+            trend_df=pd.DataFrame(trend).sort_values("Date").reset_index(drop=True)
+            chart_long=trend_df.melt(
+                id_vars=["Month","Date"],
+                value_vars=["Import (MU)","Export (MU)","Net injection (MU)"],
+                var_name="Series",value_name="MU"
+            )
+            month_order=trend_df["Month"].tolist()
+            chart=alt.Chart(chart_long).mark_line(point=True).encode(
+                x=alt.X("Month:N",sort=month_order,
+                        axis=alt.Axis(title=None,labelAngle=0,labelOverlap=False)),
+                y=alt.Y("MU:Q",title="MU"),
+                color=alt.Color("Series:N",title=None),
+                tooltip=[
+                    alt.Tooltip("Month:N",title="Month"),
+                    alt.Tooltip("Series:N",title="Series"),
+                    alt.Tooltip("MU:Q",title="MU",format=".6f")
+                ]
+            ).properties(height=360)
+            st.altair_chart(chart,width="stretch")
+            st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
 
