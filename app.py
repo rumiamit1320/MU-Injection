@@ -443,7 +443,10 @@ class PostgresConnection:
         sql = re.sub(r"ALTER TABLE (\w+) ADD COLUMN ", r"ALTER TABLE \1 ADD COLUMN IF NOT EXISTS ", sql, flags=re.I)
         sql = re.sub(r"^\s*INSERT OR IGNORE INTO ", "INSERT INTO ", sql, flags=re.I)
         sql = sql.replace("last_insert_rowid() AS id", "currval(pg_get_serial_sequence('feeder_master','id')) AS id")
-        return sql.replace("?", "%s")
+        # psycopg2 treats % as a parameter marker. The application SQL uses
+        # SQLite-style ? placeholders, so escape literal percent signs first
+        # (for example LIKE '__DIRECT_MU__%') and then convert ? to %s.
+        return sql.replace("%", "%%").replace("?", "%s")
 
     def execute(self, sql, params=None):
         sql2=self._sql(sql)
