@@ -2270,96 +2270,197 @@ elif page=="Feeder Master":
 elif page=="MU Template":
     st.subheader(f"MU Template — {calendar.month_name[month]} {year}")
     st.caption(
-        "This is the report layout used by the generated MU Injection Excel. "
-        "Add an existing Feeder Master feeder to Section A, B or C for this month only."
+        "Verify the current feeder template by classification. "
+        "Feeder name and meter number are shown directly from Feeder Master. "
+        "Use Search Feeder Master to add an existing feeder to the selected monthly report section."
     )
 
-    section_labels = {
-        "A": "A — Import from GSS",
-        "B": "B — Import from other circle",
-        "C": "C — Export to other circle",
-    }
+    template_sections = [
+        ("A", "Import from GSS"),
+        ("B", "Import from other circle"),
+        ("C", "Export to other circle"),
+        ("OA", "Open Access"),
+    ]
 
-    tabs = st.tabs(list(section_labels.values()))
-    for tab, sec in zip(tabs, ["A", "B", "C"]):
+    tabs = st.tabs([label for _, label in template_sections])
+    for tab, (sec, label) in zip(tabs, template_sections):
         with tab:
-            st.markdown(f"### {section_labels[sec]}")
+            st.markdown(f"### {label}")
+
+            if sec == "OA":
+                classification_rows = con.execute(
+                    """SELECT feeder_name, meter_no, mf, division_name, subdivision
+                       FROM feeder_master
+                       WHERE active=1 AND selection_type=?
+                       ORDER BY feeder_name, meter_no""",
+                    ("Open Access",)
+                ).fetchall()
+                st.caption("Current Feeder Master classification — Open Access")
+                if classification_rows:
+                    st.dataframe(
+                        [
+                            {
+                                "Feeder Name": r["feeder_name"],
+                                "Meter No.": r["meter_no"],
+                                "MF": r["mf"],
+                                "Division": r["division_name"],
+                                "Subdivision": r["subdivision"],
+                            }
+                            for r in classification_rows
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                else:
+                    st.info("No feeder is currently classified as Open Access in Feeder Master.")
+
+                st.divider()
+                st.markdown("**Search Feeder Master**")
+                oa_search = st.text_input(
+                    "Search feeder or meter number",
+                    placeholder="Search by feeder name or meter number…",
+                    key=f"mu_template_search_OA_{year}_{month}",
+                ).strip()
+                if oa_search:
+                    needle = oa_search.casefold()
+                    matches = [
+                        r for r in get_feeders(con, active_only=True)
+                        if needle in str(r["feeder_name"] or "").casefold()
+                        or needle in str(r["meter_no"] or "").casefold()
+                    ]
+                    if not matches:
+                        st.warning(
+                            "No matching feeder was found in Feeder Master. "
+                            "Add the feeder in Feeder Master first, then return here."
+                        )
+                        if st.button(
+                            "Open Feeder Master",
+                            key=f"mu_template_open_master_OA_{year}_{month}",
+                            width="stretch",
+                        ):
+                            st.session_state["selected_page"] = "Feeder Master"
+                            st.rerun()
+                    else:
+                        st.info(
+                            "The feeder exists in Feeder Master. To classify it as Open Access, "
+                            "set Selection = Open Access in Feeder Master."
+                        )
+                        st.dataframe(
+                            [
+                                {
+                                    "Feeder Name": r["feeder_name"],
+                                    "Meter No.": r["meter_no"],
+                                    "MF": r["mf"],
+                                    "Current Selection": selection_label_for_row(r),
+                                }
+                                for r in matches
+                            ],
+                            width="stretch",
+                            hide_index=True,
+                        )
+                continue
+
+            # A/B/C are the actual monthly MU report sections.
+            classification_rows = con.execute(
+                """SELECT feeder_name, meter_no, mf, division_name, subdivision
+                   FROM feeder_master
+                   WHERE active=1 AND selection_type=?
+                   ORDER BY feeder_name, meter_no""",
+                (label,)
+            ).fetchall()
+
+            st.caption("Current Feeder Master classification")
+            if classification_rows:
+                st.dataframe(
+                    [
+                        {
+                            "Feeder Name": r["feeder_name"],
+                            "Meter No.": r["meter_no"],
+                            "MF": r["mf"],
+                            "Division": r["division_name"],
+                            "Subdivision": r["subdivision"],
+                        }
+                        for r in classification_rows
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.info(f"No feeder is currently classified as {label} in Feeder Master.")
+
+            st.divider()
+            st.markdown("**Add feeder to this month's report section**")
             st.caption(
-                "Excel columns: SL No. · Feeder / Injection Point · Meter No. · "
-                "Last Reading · Present Reading · Difference · MF · MU · Remarks"
+                "Search the Feeder Master database. The feeder must already exist in Feeder Master."
             )
 
-            search_key = f"mu_template_search_{sec}_{year}_{month}"
             search = st.text_input(
-                "Search Feeder Master",
+                "Search feeder or meter number",
                 placeholder="Search by feeder name or meter number…",
-                key=search_key,
+                key=f"mu_template_search_{sec}_{year}_{month}",
             ).strip()
 
-            master_rows = get_feeders(con, active_only=True)
             if search:
                 needle = search.casefold()
                 matches = [
-                    r for r in master_rows
+                    r for r in get_feeders(con, active_only=True)
                     if needle in str(r["feeder_name"] or "").casefold()
                     or needle in str(r["meter_no"] or "").casefold()
                 ]
-            else:
-                matches = []
 
-            if search and not matches:
-                st.warning(
-                    "No matching feeder was found in Feeder Master. "
-                    "Add the feeder in Feeder Master first, then return here."
-                )
-                if st.button(
-                    "Open Feeder Master",
-                    key=f"mu_template_open_master_{sec}_{year}_{month}",
-                    width="stretch",
-                ):
-                    st.session_state["selected_page"] = "Feeder Master"
-                    st.rerun()
-            elif matches:
-                options = [
-                    f"{r['feeder_name']}  |  {r['meter_no']}  |  MF: {r['mf']}"
-                    for r in matches
-                ]
-                selected = st.selectbox(
-                    "Select feeder",
-                    options,
-                    key=f"mu_template_select_{sec}_{year}_{month}",
-                )
-                selected_row = matches[options.index(selected)]
-
-                already = con.execute(
-                    """SELECT report_section FROM monthly_readings
-                       WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
-                    (selected_row["id"], year, month)
-                ).fetchone()
-
-                if already is not None and already["report_section"] == sec:
-                    st.info("This feeder is already present in this section for the selected month.")
-                elif already is not None and already["report_section"] in ("A", "B", "C"):
-                    old_sec = already["report_section"]
+                if not matches:
                     st.warning(
-                        f"This feeder is currently in Section {old_sec} for this month. "
-                        "Adding it here will move its month-specific report row to this section."
+                        "No matching feeder was found in Feeder Master. "
+                        "Add the feeder in Feeder Master first, then return here."
                     )
-
-                if st.button(
-                    f"Add to {section_labels[sec]}",
-                    key=f"mu_template_add_{sec}_{year}_{month}_{selected_row['id']}",
-                    type="primary",
-                    width="stretch",
-                ):
-                    ok, message = add_feeder_to_mu_template(
-                        con, selected_row["id"], year, month, sec
-                    )
-                    if ok:
-                        st.success(f"{message} added to {section_labels[sec]}.")
+                    if st.button(
+                        "Open Feeder Master",
+                        key=f"mu_template_open_master_{sec}_{year}_{month}",
+                        width="stretch",
+                    ):
+                        st.session_state["selected_page"] = "Feeder Master"
                         st.rerun()
-                    else:
-                        st.error(message)
+                else:
+                    options = [
+                        f"{r['feeder_name']}  |  {r['meter_no']}  |  MF: {r['mf']}"
+                        for r in matches
+                    ]
+                    selected = st.selectbox(
+                        "Select feeder",
+                        options,
+                        key=f"mu_template_select_{sec}_{year}_{month}",
+                    )
+                    selected_row = matches[options.index(selected)]
+
+                    already = con.execute(
+                        """SELECT report_section FROM monthly_readings
+                           WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
+                        (selected_row["id"], year, month)
+                    ).fetchone()
+
+                    if already is not None and already["report_section"] == sec:
+                        st.info("This feeder is already present in this section for the selected month.")
+                    elif already is not None and already["report_section"] in ("A", "B", "C"):
+                        old_sec = already["report_section"]
+                        st.warning(
+                            f"This feeder is currently in Section {old_sec} for this month. "
+                            "Adding it here will move its month-specific report row to this section."
+                        )
+
+                    if st.button(
+                        f"Add to {label}",
+                        key=f"mu_template_add_{sec}_{year}_{month}_{selected_row['id']}",
+                        type="primary",
+                        width="stretch",
+                    ):
+                        ok, message = add_feeder_to_mu_template(
+                            con, selected_row["id"], year, month, sec
+                        )
+                        if ok:
+                            st.success(f"{message} added to {label}.")
+                            st.rerun()
+                        else:
+                            st.error(message)
 
             report_rows = con.execute(
                 """SELECT r.report_sl_no, r.report_feeder_name, r.report_meter_no,
@@ -2372,9 +2473,9 @@ elif page=="MU Template":
             ).fetchall()
 
             st.divider()
-            st.markdown("**Current Excel section preview**")
+            st.markdown("**Current monthly Excel section preview**")
             if not report_rows:
-                st.info("No feeders have been added to this section for the selected month.")
+                st.info("No feeders have been added to this monthly report section yet.")
             else:
                 preview = []
                 for rr in report_rows:
@@ -2386,7 +2487,7 @@ elif page=="MU Template":
                         mu = (float(present) - float(last)) * float(rr["report_mf"] or 1) / 1000.0
                     preview.append({
                         "SL No.": rr["report_sl_no"],
-                        "Feeder / Injection Point": rr["report_feeder_name"],
+                        "Feeder Name": rr["report_feeder_name"],
                         "Meter No.": rr["report_meter_no"],
                         "Last Reading": last,
                         "Present Reading": present if present not in (None, 0) else None,
