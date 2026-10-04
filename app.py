@@ -1252,10 +1252,6 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 source_meter_no = "" if source_meter_no is None else str(source_meter_no).strip()
                 feeder = source_feeder_name
                 meter = source_meter_no
-                if not feeder and not meter and present is None and manual_mu is None:
-                    skipped.append(f"{sec}: blank source row")
-                    continue
-                feeder_for_master = feeder or f"__REPORT_ROW__{sec}_{r}"
 
                 # Some historical circle workbooks contain a manual MU value
                 # in column H even when meter readings are unavailable or when
@@ -1270,6 +1266,11 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                     computed_mu is None or abs(float(energy_mu) - float(computed_mu)) > 1e-9
                 ):
                     manual_mu = float(energy_mu)
+
+                if not feeder and not meter and present is None and manual_mu is None:
+                    skipped.append(f"{sec}: blank source row")
+                    continue
+                feeder_for_master = feeder or f"__REPORT_ROW__{sec}_{r}"
 
                 if not meter:
                     if manual_mu is None:
