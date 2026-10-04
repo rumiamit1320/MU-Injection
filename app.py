@@ -661,44 +661,91 @@ def _division_identity_key(value):
     text = re.sub(r"_export\s*$", "", text)
     return re.sub(r"[^a-z0-9]+", "", text)
 
+_DIVISION_REFERENCE_ROWS = {
+    "Jorhat-1": [
+        (4,"33 KV JORHAT-I",33,"IEM00000393A",120,"IMPORT"),
+        (5,"33 KV JORHAT-II",33,"IEM00000410A",120,"IMPORT"),
+        (6,"33 KV JORHAT-III",33,"IEM00000129A",180,"IMPORT"),
+        (7,"33 KV Line From GARMUR GSS To GARMUR S/s",33,"IEM00000328A",180,"IMPORT"),
+        (8,"33 KV GARMUR-KAKOJAN",33,"IEM00000540A",120,"IMPORT"),
+        (9,"33 KV MURMURIA LINE",33,"IEM00000484A",90,"IMPORT"),
+        (10,"33 KV Stadium Fdr",33,"Q1025028",2,"IMPORT"),
+        (11,"33 KV KAMARBONDHA-GOTONGA",33,"8876696",12,"IMPORT"),
+        (12,"33 KV GOTONGA-KAMARBONDHA",33,"8876908",24,"EXPORT"),
+        (13,"33 KV MARIANI-BAGDHARA",33,"IEM00000370A",60,"IMPORT"),
+        (14,"33 KV DERGAON",33,"IEM00000192A",120,"IMPORT"),
+        (15,"33 KV PANICHUKUA",33,"IEM00000184A",120,"IMPORT"),
+        (16,"33 KV PULIBOR",33,"IEM00000214A",120,"IMPORT"),
+        (17,"33 KV AJANTA BYPASS ",33,"IEM00000390A",120,"IMPORT"),
+        (18,"33 KV Panichokua-Gotonga",33,"IEM00000400A",120,"IMPORT"),
+        (19,"11 KV DHEKIAJULI--LICHUBARI ",11,"8876856",4,"EXPORT"),
+        (20,"33 KV Khoomtai-Rangoliting_export",33,"8876931",6,"EXPORT"),
+        (21,"33 KV Khoomtai-Rangoliting",33,"8876931",6,"IMPORT"),
+        (22,"33 KV Radhabari-Rangoliting",33,"8876928",24,"IMPORT"),
+        (23,"33 KV Radhabari-Rangoliting_export",33,"8876928",24,"EXPORT"),
+        (24,"33 KV kundargaon (AIIDC) Control Room RE",33,"23081416",12,"EXPORT"),
+        (25,"11 KV MURMURRIA INDUSTRY FDR.",11,"X0688252",4,"EXPORT"),
+        (26,"33 KV Teok-Garmur(EXIM)_export",33,"8635126",24,"EXPORT"),
+        (27,"33 KV Teok-Garmur(EXIM)",33,"8635126",24,"IMPORT"),
+        (28,"33 KV Teok-Garmur(Panel Meter)_export",33,"8867261",120,"EXPORT"),
+        (29,"33 KV Teok-Garmur(Panel Meter)",33,"8867261",120,"IMPORT"),
+    ],
+    "Teok": [
+        (5,"33 KV MARIANI-TEOK (Tapping)",33,"X0324536",12,"IMPORT"),
+        (6,"33 KV KOLIAPANI-TEOK",33,"IEM00000341A",120,"IMPORT"),
+        (7,"33 KV TEOK-BHOGAMUKH",33,"IEM00000408A",120,"IMPORT"),
+        (8,"33 KV NAKACHARI-GABHURU",33,"X0875283",1,"IMPORT"),
+        (9,"33 kV Teok-Mudoijan",33,"8876979",12,"EXPORT"),
+        (10,"33 KV Nakachari Teok",33,"8876852",24,"IMPORT"),
+        (11,"33 KV Nakachari Teok_export",33,"8876852",24,"EXPORT"),
+        (12,"11 KV GABHORU (From AMGURI S/s)",11,"20090467",2,"IMPORT"),
+        (13,"11 KV GAURISAGAR-CHINTAMANIGARH",11,"AS675622",0.5,"IMPORT"),
+        (14,"11 KV GAURISAGAR-KHANAMUKH",11,"AS799650",0.5,"IMPORT"),
+        (15,"11 KV Khanamukh-Charingia",11,"20112442",2,"IMPORT"),
+        (16,"11 KV Feeder No.8 BUDHBORIA  (From NAKACHARI S/S)",11,"APC07963",4,"IMPORT"),
+        (17,"11 KV Uttor Dulia Fdr",11,"21102143",20,"IMPORT"),
+        (18,"11 KV Feeder No.2 ",11,None,None,"EXPORT"),
+        (19,"11 KV Feeder No.6 (JELANGITOP)",11,None,None,"EXPORT"),
+        (22,"33 KV Teok-Kakojan(SE)",33,"IEM00000454A",120,"IMPORT"),
+        (23,"33 KV Teok-Garmur(EXIM)",33,"8635126",24,"IMPORT"),
+        (24,"33 KV Teok-Garmur(EXIM)_export",33,"8635126",24,"EXPORT"),
+        (25,"34 KV Teok-Garmur(Panel Meter)",33,"8867261",120,"IMPORT"),
+        (26,"35 KV Teok-Garmur(Panel Meter)_export",33,"8867261",120,"EXPORT"),
+        (27,"33 kV Teok-Mudoijan",None,"8876979",12,"IMPORT"),
+        (28,"11 KV Uttor Dulia Fdr",11,"21102143",20,"EXPORT"),
+        (29,"11 KV Feeder No.2",None,None,1,"IMPORT"),
+    ],
+    "Jorhat-2": [
+        (5,"33 KV MARIANI-TITABAR",33,"IEM00000237A",120,"IMPORT"),
+        (6,"11 KV DHEKIAJULI/LICHUBARI ",11,"8876856",4,"IMPORT"),
+        (7,"33 KV kundargaon (AIIDC) Control Room RE",33,"23081416",12,"IMPORT"),
+        (8,"11KV BOSA (ATHKHELIA)",11,"8876722",3,"IMPORT"),
+        (9,"33 KV WOKHA-BORHOLLA",33,"8876853",24,"IMPORT"),
+        (10,"33 KV WOKHA-BORHOLLA_export",33,"8876853",24,"EXPORT"),
+        (13,"33 KV MARIANI ",33,"IEM00000269A",120,"IMPORT"),
+        (14,"33 KV PGCIL",33,"IEM00000351A",60,"IMPORT"),
+        (15,"33 KV PGCIL-II(IRCA Consumer)",33,"21102176",15,"IMPORT"),
+        (16,"33 KV MARIANI -DHOPATBARI (GSS)",33,"IEM00000282A",60,"IMPORT"),
+        (17,"33 KV Nakachari-Gabhuru",33,"X0875283",1,"EXPORT"),
+        (18,"33 KV Nakachari-Teok ",33,"8876852",24,"EXPORT"),
+        (20,"11 KV MURMURRIA INDUSTRY FDR.",11,"X0688252",4,"IMPORT"),
+        (21,"11 KV feeder No.8 From NAKACHARI",11,"APC07963",4,"EXPORT"),
+        (24,"33 KV GARAMUR ",33,"IEM00000261A",30,"IMPORT"),
+        (25,"33 KV PHULONI",33,"IEM00000462A",30,"IMPORT"),
+        (26,"33 KV GARMUR-II (BONGAON)",33,"IEM00000472A",30,"IMPORT"),
+    ],
+}
+
 def _division_template_rows(division_name):
-    path = APP_DIR / "MU_Injection_All_Divisions_Template.xlsx"
-    if not path.exists():
-        return []
-    wb = openpyxl.load_workbook(path, data_only=False)
-    sheet_name = DIVISIONS[division_name]
-    if sheet_name not in wb.sheetnames:
-        return []
-    ws = wb[sheet_name]
-    rows = []
-    for start, end in division_row_ranges(sheet_name):
-        for r in range(start, end + 1):
-            if isinstance(ws.cell(r, 2), MergedCell):
-                continue
-            feeder = ws.cell(r, 2).value
-            meter = ws.cell(r, 4).value
-            mf = ws.cell(r, 5).value
-            voltage = ws.cell(r, 3).value
-            i_cell = ws.cell(r, 9).value
-            j_cell = ws.cell(r, 10).value
-            if i_cell is None and j_cell is None:
-                continue
-            if feeder is None and meter is None:
-                continue
-            flow = "IMPORT" if i_cell is not None and j_cell is None else "EXPORT" if j_cell is not None and i_cell is None else None
-            if flow is None:
-                continue
-            rows.append({
-                "sheet_row": r,
-                "subdivision": _division_template_subdivision(division_name, r),
-                "feeder_name": str(feeder).strip() if feeder is not None else None,
-                "meter_no": str(meter).strip() if meter is not None else None,
-                "mf": _to_float(mf),
-                "voltage_kv": _to_float(voltage),
-                "flow_direction": flow,
-                "report_sl_no": ws.cell(r, 1).value if isinstance(ws.cell(r, 1).value, (int, float)) else None,
-            })
-    return rows
+    return [
+        {
+            "sheet_row":r,"subdivision":_division_template_subdivision(division_name,r),
+            "feeder_name":name,"meter_no":meter,"mf":mf,"voltage_kv":voltage,
+            "flow_direction":flow,"report_sl_no":None
+        }
+        for r,name,voltage,meter,mf,flow in _DIVISION_REFERENCE_ROWS.get(division_name,[])
+    ]
+
 
 def ensure_division_template_reference(con):
     ensure_division_master(con)
