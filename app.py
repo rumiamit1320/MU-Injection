@@ -188,6 +188,10 @@ def db_sqlite():
         direct_mu_note TEXT,
         report_section TEXT,
         report_order INTEGER,
+        report_feeder_name TEXT,
+        report_meter_no TEXT,
+        report_mf REAL,
+        report_sl_no REAL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(feeder_id, year, month),
@@ -255,7 +259,7 @@ def db_sqlite():
         except sqlite3.OperationalError:
             pass
 
-    for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER")]:
+    for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER"), ("report_feeder_name", "TEXT"), ("report_meter_no", "TEXT"), ("report_mf", "REAL"), ("report_sl_no", "REAL")]:
         try:
             con.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             con.commit()
@@ -334,6 +338,10 @@ class PostgresConnection:
             direct_mu_note TEXT,
             report_section TEXT,
             report_order INTEGER,
+            report_feeder_name TEXT,
+            report_meter_no TEXT,
+            report_mf REAL,
+            report_sl_no REAL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(feeder_id, year, month),
@@ -1229,18 +1237,25 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
         con.execute("BEGIN")
         for sec in ["A", "B", "C"]:
             for r in _find_section_rows(ws, sec):
-                feeder = ws.cell(r, 2).value
-                meter = ws.cell(r, 3).value
+                source_feeder_name = ws.cell(r, 2).value
+                source_meter_no = ws.cell(r, 3).value
+                source_sl_no = _to_float(ws.cell(r, 1).value)
+                feeder = source_feeder_name
+                meter = source_meter_no
                 last = _to_float(ws.cell(r, 4).value)
                 present = _to_float(ws.cell(r, 5).value)
                 mf = _to_float(ws.cell(r, 7).value)
                 energy_mu = _to_float(ws_values.cell(r, 8).value)
                 remarks = ws.cell(r, 9).value
 
-                if feeder is None or str(feeder).strip() == "":
+                source_feeder_name = "" if source_feeder_name is None else str(source_feeder_name).strip()
+                source_meter_no = "" if source_meter_no is None else str(source_meter_no).strip()
+                feeder = source_feeder_name
+                meter = source_meter_no
+                if not feeder and not meter and present is None and manual_mu is None:
+                    skipped.append(f"{sec}: blank source row")
                     continue
-                feeder = str(feeder).strip()
-                meter = "" if meter is None else str(meter).strip()
+                feeder_for_master = feeder or f"__REPORT_ROW__{sec}_{r}"
 
                 # Some historical circle workbooks contain a manual MU value
                 # in column H even when meter readings are unavailable or when
@@ -1270,7 +1285,7 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 mf = 1.0 if mf is None else mf
 
                 feeder_id, created_master = find_or_create_meter_master(
-                    con, feeder, meter, mf, sec
+                    con, feeder_for_master, meter, mf, sec
                 )
                 if created_master:
                     new_master += 1
@@ -1308,8 +1323,9 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 con.execute("""
                     INSERT INTO monthly_readings
                     (feeder_id,year,month,reading_kwh,last_reading_kwh,remarks,
-                     direct_mu,direct_mu_note,report_section,report_order)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                     direct_mu,direct_mu_note,report_section,report_order,
+                     report_feeder_name,report_meter_no,report_mf,report_sl_no)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(feeder_id,year,month)
                     DO UPDATE SET
                         reading_kwh=excluded.reading_kwh,
@@ -1319,6 +1335,10 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                         direct_mu_note=excluded.direct_mu_note,
                         report_section=excluded.report_section,
                         report_order=excluded.report_order,
+                        report_feeder_name=excluded.report_feeder_name,
+                        report_meter_no=excluded.report_meter_no,
+                        report_mf=excluded.report_mf,
+                        report_sl_no=excluded.report_sl_no,
                         updated_at=CURRENT_TIMESTAMP
                 """, (
                     feeder_id, year, month,
@@ -1328,7 +1348,11 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                     manual_mu,
                     "Imported Direct MU from workbook column H" if manual_mu is not None else None,
                     sec,
-                    r
+                    r,
+                    source_feeder_name,
+                    source_meter_no,
+                    mf,
+                    source_sl_no
                 ))
                 if manual_mu is not None:
                     direct_mu_imported += 1
@@ -1393,7 +1417,8 @@ def build_report(con, year, month):
 
     for sec in ["A","B","C"]:
         rows = con.execute("""
-            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
+            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks,
+                   r.report_feeder_name, r.report_meter_no, r.report_mf, r.report_sl_no
             FROM monthly_readings r
             JOIN feeder_master f ON f.id=r.feeder_id
             WHERE r.year=? AND r.month=?
@@ -1424,7 +1449,8 @@ def build_report(con, year, month):
                 ws.cell(r,c).value=None
 
         rows=con.execute("""
-            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks
+            SELECT f.*, r.reading_kwh, r.last_reading_kwh, r.direct_mu, r.remarks,
+                   r.report_feeder_name, r.report_meter_no, r.report_mf, r.report_sl_no
             FROM monthly_readings r
             JOIN feeder_master f ON f.id=r.feeder_id
             WHERE r.year=? AND r.month=?
@@ -1445,11 +1471,16 @@ def build_report(con, year, month):
 
             serial += 1
             r=start_row+serial-1
-            meter_no="" if str(row["meter_no"]).startswith("__DIRECT_MU__") else row["meter_no"]
+            meter_no = row["report_meter_no"]
+            if meter_no is None or str(meter_no).startswith("__DIRECT_MU__"):
+                meter_no = ""
+            report_name = row["report_feeder_name"]
+            if report_name is None or str(report_name).startswith("__REPORT_ROW__"):
+                report_name = ""
             remarks=row["remarks"]
 
-            ws.cell(r,1).value=serial
-            ws.cell(r,2).value=row["feeder_name"]
+            ws.cell(r,1).value=row["report_sl_no"]
+            ws.cell(r,2).value=report_name
             ws.cell(r,3).value=meter_no
 
             # Direct-MU-only rows do not invent Last/Present/MF values.
@@ -1482,7 +1513,7 @@ def build_report(con, year, month):
             ws.cell(r,4).value=source_last
             ws.cell(r,5).value=present
             ws.cell(r,6).value=f"=E{r}-D{r}"
-            ws.cell(r,7).value=row["mf"]
+            ws.cell(r,7).value=row["report_mf"] if row["report_mf"] is not None else row["mf"]
             ws.cell(r,8).value=(
                 float(direct_mu)
                 if direct_mu is not None
