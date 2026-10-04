@@ -393,7 +393,7 @@ class PostgresConnection:
         for col, typ in [("division_name", "TEXT"), ("subdivision", "TEXT"), ("voltage_kv", "REAL"), ("energy_direction", "TEXT"), ("selection_type", "TEXT")]:
             self.execute(f"ALTER TABLE feeder_master ADD COLUMN {col} {typ}")
             self.commit()
-        for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER")]:
+        for col, typ in [("last_reading_kwh", "REAL"), ("direct_mu", "REAL"), ("direct_mu_note", "TEXT"), ("report_section", "TEXT"), ("report_order", "INTEGER"), ("report_feeder_name", "TEXT"), ("report_meter_no", "TEXT"), ("report_mf", "REAL"), ("report_sl_no", "REAL")]:
             self.execute(f"ALTER TABLE monthly_readings ADD COLUMN {col} {typ}")
             self.commit()
         self.execute("""UPDATE feeder_master
