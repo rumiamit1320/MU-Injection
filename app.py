@@ -1081,6 +1081,20 @@ def division_report(con,year,month,division_name):
         "Teok^":[("Teok",5,19,20),("Kakojan",22,29,30)]
     }[sheet_name]
 
+    # Force the July reference feeder identity into every canonical row,
+    # including rows that have no reading for the selected month.
+    reference_rows=con.execute("""SELECT sheet_row,report_feeder_name,report_meter_no,
+                                         report_mf,voltage_kv
+                                  FROM division_row_template
+                                  WHERE division_id=? AND active=1
+                                  ORDER BY sheet_row""",(div_id,)).fetchall()
+    for ref in reference_rows:
+        rr=ref["sheet_row"]
+        if not isinstance(ws.cell(rr,2),MergedCell): ws.cell(rr,2).value=ref["report_feeder_name"]
+        if not isinstance(ws.cell(rr,3),MergedCell): ws.cell(rr,3).value=ref["voltage_kv"]
+        if not isinstance(ws.cell(rr,4),MergedCell): ws.cell(rr,4).value=ref["report_meter_no"]
+        if not isinstance(ws.cell(rr,5),MergedCell): ws.cell(rr,5).value=ref["report_mf"]
+
     negative_maps=con.execute("""SELECT m.*,f.feeder_name,f.meter_no,f.mf,f.voltage_kv
                                  FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
                                  WHERE m.division_id=? AND m.active=1 AND m.sheet_row<0
