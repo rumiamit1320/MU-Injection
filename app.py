@@ -1156,12 +1156,15 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
     becomes the stored January reading and January Last becomes its baseline.
     """
     wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
+    wb_values = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=True)
     ws = wb["MU inj JEC"] if "MU inj JEC" in wb.sheetnames else wb.active
+    ws_values = wb_values["MU inj JEC"] if "MU inj JEC" in wb_values.sheetnames else wb_values.active
     imported = []
     skipped = []
     updated_master = 0
     new_master = 0
     overwritten = 0
+    direct_mu_imported = 0
 
     try:
         con.execute("BEGIN")
@@ -1172,16 +1175,37 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 last = _to_float(ws.cell(r, 4).value)
                 present = _to_float(ws.cell(r, 5).value)
                 mf = _to_float(ws.cell(r, 7).value)
+                energy_mu = _to_float(ws_values.cell(r, 8).value)
                 remarks = ws.cell(r, 9).value
 
                 if feeder is None or str(feeder).strip() == "":
                     continue
                 feeder = str(feeder).strip()
                 meter = "" if meter is None else str(meter).strip()
+
+                # Some historical circle workbooks contain a manual MU value
+                # in column H even when meter readings are unavailable or when
+                # Present-Last does not reproduce the stated MU. Preserve that
+                # value as the app's explicit Direct MU fallback instead of
+                # silently discarding it.
+                computed_mu = None
+                if last is not None and present is not None:
+                    computed_mu = (present - last) * (1.0 if mf is None else mf) / 1000.0
+                manual_mu = None
+                if energy_mu is not None and (
+                    computed_mu is None or abs(float(energy_mu) - float(computed_mu)) > 1e-9
+                ):
+                    manual_mu = float(energy_mu)
+
                 if not meter:
-                    skipped.append(f"{sec}: {feeder} — meter number is blank")
-                    continue
-                if present is None:
+                    if manual_mu is None:
+                        skipped.append(f"{sec}: {feeder} — meter number is blank")
+                        continue
+                    # Stable synthetic identifier for a workbook row that has
+                    # only a manual MU value and no meter reading.
+                    meter = f"__DIRECT_MU__{sec}_{r}"
+
+                if present is None and manual_mu is None:
                     skipped.append(f"{sec}: {feeder} / {meter} — present reading is blank")
                     continue
                 mf = 1.0 if mf is None else mf
@@ -1224,14 +1248,24 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
                 # always calculated by the application from Present-Last and MF.
                 con.execute("""
                     INSERT INTO monthly_readings
-                    (feeder_id,year,month,reading_kwh,remarks)
-                    VALUES(?,?,?,?,?)
+                    (feeder_id,year,month,reading_kwh,remarks,direct_mu,direct_mu_note)
+                    VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(feeder_id,year,month)
                     DO UPDATE SET
                         reading_kwh=excluded.reading_kwh,
                         remarks=excluded.remarks,
+                        direct_mu=excluded.direct_mu,
+                        direct_mu_note=excluded.direct_mu_note,
                         updated_at=CURRENT_TIMESTAMP
-                """, (feeder_id, year, month, present, remarks))
+                """, (
+                    feeder_id, year, month,
+                    0.0 if present is None else present,
+                    remarks,
+                    manual_mu,
+                    "Imported Direct MU from workbook column H" if manual_mu is not None else None
+                ))
+                if manual_mu is not None:
+                    direct_mu_imported += 1
                 if existing is not None:
                     overwritten += 1
                 else:
@@ -1247,6 +1281,7 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
         "new_master": new_master,
         "updated_master": updated_master,
         "overwritten": overwritten,
+        "direct_mu_imported": direct_mu_imported,
         "skipped": skipped,
     }
 
@@ -1921,7 +1956,8 @@ elif page=="Import Excel":
                         f"Imported {result['imported']} monthly readings. "
                         f"Added {result['new_master']} new feeder records. "
                         f"Updated {result['updated_master']} existing feeder records. "
-                        f"Overwritten {result['overwritten']} existing monthly readings."
+                        f"Overwritten {result['overwritten']} existing monthly readings. "
+                        f"Imported {result.get('direct_mu_imported', 0)} Direct MU exceptions."
                     )
                 else:
                     result=import_all_division_workbook(
@@ -1987,6 +2023,7 @@ else:
             t=month_energy_summary(con,y,m)
             trend.append({
                 "Month":f"{calendar.month_abbr[m]} {y}",
+                "Date":datetime(y,m,1),
                 "A — GSS":t["A"],
                 "B — Other circle":t["B"],
                 "C — Export":t["C"],
@@ -1994,9 +2031,10 @@ else:
             })
             y,m=previous_period(y,m)
         trend.reverse()
-        trend_df=pd.DataFrame(trend).set_index("Month")
-        st.line_chart(trend_df,width="stretch")
-        st.dataframe(trend_df.reset_index(),width="stretch",hide_index=True)
+        trend_df=pd.DataFrame(trend).sort_values("Date")
+        chart_df=trend_df.set_index("Date").drop(columns=["Month"])
+        st.line_chart(chart_df,width="stretch")
+        st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
 
     else:
         totals=division_energy_summary(con,year,month,division_name)
@@ -2022,12 +2060,14 @@ else:
             t=division_energy_summary(con,y,m,division_name)
             trend.append({
                 "Month":f"{calendar.month_abbr[m]} {y}",
+                "Date":datetime(y,m,1),
                 "Import (MWh)":t["IMPORT"],
                 "Export (MWh)":t["EXPORT"],
                 "Net injection (MWh)":t["NET"],
             })
             y,m=previous_period(y,m)
         trend.reverse()
-        trend_df=pd.DataFrame(trend).set_index("Month")
-        st.line_chart(trend_df,width="stretch")
-        st.dataframe(trend_df.reset_index(),width="stretch",hide_index=True)
+        trend_df=pd.DataFrame(trend).sort_values("Date")
+        chart_df=trend_df.set_index("Date").drop(columns=["Month"])
+        st.line_chart(chart_df,width="stretch")
+        st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
