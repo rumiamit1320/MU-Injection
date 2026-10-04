@@ -1311,6 +1311,28 @@ def delete_reading(con, feeder_id, year, month):
     """, (feeder_id,year,month))
     con.commit()
 
+def delete_month_year_data(con, year, month):
+    """Delete all monthly data for exactly one year/month.
+
+    Feeder Master, Division mappings/template, and authentication data are
+    preserved. This removes shared monthly readings, Division row readings,
+    and meter-change history for the selected period.
+    """
+    counts={}
+    for table in ("monthly_readings","division_row_readings","meter_change_history"):
+        row=con.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE year=? AND month=?",(year,month)).fetchone()
+        counts[table]=int(row["n"] if row is not None else 0)
+    con.execute("BEGIN")
+    try:
+        con.execute("DELETE FROM division_row_readings WHERE year=? AND month=?",(year,month))
+        con.execute("DELETE FROM monthly_readings WHERE year=? AND month=?",(year,month))
+        con.execute("DELETE FROM meter_change_history WHERE year=? AND month=?",(year,month))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    return counts
+
 def add_feeder(con, feeder_name, meter_no, mf, entry_type, initial, division_name, subdivision, voltage_kv, energy_direction, selection_type=None):
     flow_dir = energy_direction if energy_direction in ('IMPORT', 'EXPORT') else division_flow_from_entry_type(entry_type)
     con.execute("""INSERT INTO feeder_master
@@ -2348,6 +2370,7 @@ with st.sidebar:
         "MU Template",
         "Generate Excel",
         "Import Excel",
+        "Delete Month Data",
         "Dashboard"
     ]
     for idx, page_name in enumerate(pages):
@@ -2861,6 +2884,53 @@ elif page=="Import Excel":
         "and select Jorhat-1, Jorhat-2 or Teok. Mapped meters use the same stored "
         "monthly reading, so a second upload is not required."
     )
+
+# ---------- DELETE MONTH DATA ----------
+elif page=="Delete Month Data":
+    st.subheader("Delete Month / Year Data")
+    st.caption(
+        "Delete all stored monthly readings for exactly one selected month and year. "
+        "Feeder Master and the July Division reference structure are preserved."
+    )
+    delete_year=st.number_input("Year",2000,2100,year,1,key="delete_data_year")
+    delete_month=st.selectbox(
+        "Month",range(1,13),index=month-1,
+        format_func=lambda m:calendar.month_name[m],
+        key="delete_data_month"
+    )
+    counts={}
+    for table in ("monthly_readings","division_row_readings","meter_change_history"):
+        counts[table]=int(con.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE year=? AND month=?",
+            (delete_year,delete_month)
+        ).fetchone()["n"])
+    st.warning(
+        f"This permanently deletes {calendar.month_name[delete_month]} {delete_year} "
+        "monthly data. Feeder Master records will not be deleted."
+    )
+    st.dataframe({
+        "Database table":["monthly_readings","division_row_readings","meter_change_history"],
+        "Rows to delete":[counts["monthly_readings"],counts["division_row_readings"],counts["meter_change_history"]]
+    },width="stretch",hide_index=True)
+    confirm=st.checkbox(
+        f"I understand that {calendar.month_name[delete_month]} {delete_year} data will be deleted.",
+        key="confirm_delete_month_data"
+    )
+    if st.button(
+        f"Delete {calendar.month_name[delete_month]} {delete_year} data",
+        type="primary",width="stretch",disabled=not confirm,key="delete_month_year_button"
+    ):
+        try:
+            deleted=delete_month_year_data(con,delete_year,delete_month)
+            st.success(
+                f"Deleted {calendar.month_name[delete_month]} {delete_year}: "
+                f"{deleted['monthly_readings']} monthly readings, "
+                f"{deleted['division_row_readings']} Division readings, and "
+                f"{deleted['meter_change_history']} meter-change records."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Delete failed: {exc}")
 
 # ---------- DASHBOARD ----------
 else:
