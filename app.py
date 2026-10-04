@@ -1584,9 +1584,8 @@ def _report_rows_with_meter_continuity(con, year, month, sec):
 
 
 def add_feeder_to_mu_template(con, feeder_id, year, month, section):
-    """Add or move one feeder in the selected month's MU report section.
-    This changes only the month-specific report metadata, not feeder-master
-    classification, so historical/current master data remains intact.
+    """Add one feeder to the selected month's MU report section.
+    A feeder already assigned to another section is never moved or removed.
     """
     row = con.execute("SELECT * FROM feeder_master WHERE id=? AND active=1 LIMIT 1", (feeder_id,)).fetchone()
     if row is None:
@@ -1596,6 +1595,17 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section):
         "SELECT * FROM monthly_readings WHERE feeder_id=? AND year=? AND month=? LIMIT 1",
         (feeder_id, year, month)
     ).fetchone()
+
+    if existing is not None:
+        existing_section = existing["report_section"]
+        if existing_section == section:
+            return False, f"{row['feeder_name']} is already present in Section {section} for this month. No change was made."
+        if existing_section in ("A", "B", "C"):
+            return False, (
+                f"{row['feeder_name']} is already configured in Section {existing_section} "
+                f"for this month. It has not been removed or moved. "
+                f"The existing Section {existing_section} entry remains unchanged."
+            )
 
     max_row = con.execute(
         "SELECT COALESCE(MAX(report_order),0) AS max_order FROM monthly_readings "
@@ -2503,9 +2513,9 @@ elif page=="MU Template":
                         st.info("This feeder is already present in this section for the selected month.")
                     elif already is not None and already["report_section"] in ("A", "B", "C"):
                         old_sec = already["report_section"]
-                        st.warning(
-                            f"This feeder is currently in Section {old_sec} for this month. "
-                            "Adding it here will move its month-specific report row to this section."
+                        st.info(
+                            f"This feeder is already configured in Section {old_sec} for this month. "
+                            f"It will remain in Section {old_sec}; it will not be removed or moved."
                         )
 
                     if st.button(
@@ -2539,7 +2549,7 @@ elif page=="MU Template":
                 st.info("No feeders are currently configured in this monthly template section.")
             else:
                 preview = []
-                for rr in report_rows:
+                for preview_index, rr in enumerate(report_rows, start=1):
                     last = rr["last_reading_kwh"]
                     present = rr["reading_kwh"]
                     direct_mu = rr["direct_mu"]
@@ -2547,7 +2557,7 @@ elif page=="MU Template":
                     if mu is None and last is not None and present is not None:
                         mu = (float(present) - float(last)) * float(rr["report_mf"] or 1) / 1000.0
                     preview.append({
-                        "SL No.": rr["report_sl_no"],
+                        "SL No.": rr["report_sl_no"] if rr["report_sl_no"] is not None else preview_index,
                         "Feeder Name": rr["report_feeder_name"],
                         "Meter No.": rr["report_meter_no"],
                         "Last Reading": last,
