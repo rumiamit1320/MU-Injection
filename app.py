@@ -1583,28 +1583,134 @@ def _report_rows_with_meter_continuity(con, year, month, sec):
 
 
 
-def add_feeder_to_mu_template(con, feeder_id, year, month, section):
+def add_feeder_to_mu_template(con, feeder_id, year, month, section, initial_reading=None):
     """Add one feeder to the selected month's MU report section.
-    A feeder already assigned to another section is never moved or removed.
+
+    If the same feeder already exists in another monthly report section, keep
+    that original record untouched and create a separate feeder-master record
+    for the new section. The duplicate keeps the same meter/MF and uses an
+    explicit Import/Export name suffix so it can have its own monthly reading
+    history.
     """
-    row = con.execute("SELECT * FROM feeder_master WHERE id=? AND active=1 LIMIT 1", (feeder_id,)).fetchone()
+    row = con.execute(
+        "SELECT * FROM feeder_master WHERE id=? AND active=1 LIMIT 1",
+        (feeder_id,)
+    ).fetchone()
     if row is None:
         return False, "Feeder is not present in the active Feeder Master."
 
     existing = con.execute(
-        "SELECT * FROM monthly_readings WHERE feeder_id=? AND year=? AND month=? LIMIT 1",
+        """SELECT * FROM monthly_readings
+           WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
         (feeder_id, year, month)
     ).fetchone()
 
     if existing is not None:
         existing_section = existing["report_section"]
         if existing_section == section:
-            return False, f"{row['feeder_name']} is already present in Section {section} for this month. No change was made."
-        if existing_section in ("A", "B", "C"):
             return False, (
-                f"{row['feeder_name']} is already configured in Section {existing_section} "
-                f"for this month. It has not been removed or moved. "
-                f"The existing Section {existing_section} entry remains unchanged."
+                f"{row['feeder_name']} is already present in Section {section} "
+                "for this month. No change was made."
+            )
+
+        if existing_section in ("A", "B", "C"):
+            if initial_reading is None:
+                return False, (
+                    f"{row['feeder_name']} is already configured in Section "
+                    f"{existing_section} for this month. Enter the initial "
+                    "reading to create a separate {('Export' if section == 'C' else 'Import')} "
+                    "record in this section."
+                )
+
+            target_entry_type = section
+            target_selection = TYPE_LABELS[section]
+            target_direction = "EXPORT" if section == "C" else "IMPORT"
+            suffix = "Export" if section == "C" else "Import"
+
+            # A feeder/meter may legitimately exist once for import and once
+            # for export. Reuse an already-created target record if one exists.
+            duplicate = con.execute(
+                """SELECT * FROM feeder_master
+                   WHERE meter_no=? AND entry_type=? AND active=1
+                   LIMIT 1""",
+                (row["meter_no"], target_entry_type)
+            ).fetchone()
+
+            if duplicate is None:
+                duplicate_name = f"{row['feeder_name']} ({suffix})"
+                try:
+                    add_feeder(
+                        con,
+                        duplicate_name,
+                        row["meter_no"],
+                        row["mf"],
+                        target_entry_type,
+                        float(initial_reading),
+                        row["division_name"],
+                        row["subdivision"],
+                        row["voltage_kv"],
+                        target_direction,
+                        target_selection,
+                    )
+                except (sqlite3.IntegrityError, ValueError):
+                    duplicate = con.execute(
+                        """SELECT * FROM feeder_master
+                           WHERE meter_no=? AND entry_type=? AND active=1
+                           LIMIT 1""",
+                        (row["meter_no"], target_entry_type)
+                    ).fetchone()
+                    if duplicate is None:
+                        raise
+                duplicate = con.execute(
+                    """SELECT * FROM feeder_master
+                       WHERE meter_no=? AND entry_type=? AND active=1
+                       LIMIT 1""",
+                    (row["meter_no"], target_entry_type)
+                ).fetchone()
+            else:
+                con.execute(
+                    """UPDATE feeder_master
+                       SET initial_reading_kwh=?,
+                           division_name=?,
+                           subdivision=?,
+                           voltage_kv=?,
+                           energy_direction=?,
+                           selection_type=?,
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (
+                        float(initial_reading),
+                        row["division_name"],
+                        row["subdivision"],
+                        row["voltage_kv"],
+                        target_direction,
+                        target_selection,
+                        duplicate["id"],
+                    )
+                )
+                con.commit()
+                duplicate = con.execute(
+                    "SELECT * FROM feeder_master WHERE id=? LIMIT 1",
+                    (duplicate["id"],)
+                ).fetchone()
+
+            feeder_id = duplicate["id"]
+            row = duplicate
+            existing = con.execute(
+                """SELECT * FROM monthly_readings
+                   WHERE feeder_id=? AND year=? AND month=? LIMIT 1""",
+                (feeder_id, year, month)
+            ).fetchone()
+
+            # The newly-created duplicate must have its own monthly row so it
+            # immediately appears in the MU Template, Excel preview and
+            # Enter Readings page.
+            if existing is None:
+                pass
+        else:
+            return False, (
+                f"{row['feeder_name']} already has a monthly record for this "
+                "period that cannot be reassigned."
             )
 
     max_row = con.execute(
@@ -1628,22 +1734,15 @@ def add_feeder_to_mu_template(con, feeder_id, year, month, section):
             )
         )
     else:
-        con.execute(
-            """UPDATE monthly_readings
-               SET report_section=?,
-                   report_order=?,
-                   report_feeder_name=?,
-                   report_meter_no=?,
-                   report_mf=?,
-                   report_sl_no=?,
-                   updated_at=CURRENT_TIMESTAMP
-               WHERE id=?""",
-            (
-                section, next_order,
-                row["feeder_name"], row["meter_no"], float(row["mf"]), next_order,
-                existing["id"]
-            )
+        # Existing records already in another section are never moved. This
+        # branch is only for an existing target duplicate.
+        if existing["report_section"] == section:
+            return False, f"{row['feeder_name']} is already present in Section {section} for this month. No change was made."
+        return False, (
+            f"{row['feeder_name']} already has a monthly record for this "
+            "period. No existing section was changed."
         )
+
     con.commit()
     return True, row["feeder_name"]
 
@@ -2008,7 +2107,7 @@ with st.sidebar:
     st.markdown("### Period")
     year=st.number_input("Year",2000,2100,default_year,1)
     month_options=list(range(1,13))
-    if st.session_state.get("sidebar_month") not in month_options:
+    if "sidebar_month" not in st.session_state:
         st.session_state["sidebar_month"] = default_month
     month=st.selectbox("Month",month_options,
                        format_func=lambda m:calendar.month_name[m],
@@ -2509,13 +2608,24 @@ elif page=="MU Template":
                         (selected_row["id"], year, month)
                     ).fetchone()
 
+                    initial_reading = None
                     if already is not None and already["report_section"] == sec:
                         st.info("This feeder is already present in this section for the selected month.")
                     elif already is not None and already["report_section"] in ("A", "B", "C"):
                         old_sec = already["report_section"]
                         st.info(
                             f"This feeder is already configured in Section {old_sec} for this month. "
-                            f"It will remain in Section {old_sec}; it will not be removed or moved."
+                            f"It will remain in Section {old_sec}; it will not be removed or moved. "
+                            "If you want the same feeder in this second section, a separate "
+                            "Import/Export feeder record will be created."
+                        )
+                        initial_reading = st.number_input(
+                            "Initial reading for the new section (kWh)",
+                            min_value=0.0,
+                            value=0.0,
+                            format="%.3f",
+                            key=f"mu_template_initial_{sec}_{year}_{month}_{selected_row['id']}",
+                            help="Enter the present baseline reading of the meter for this new Import/Export record.",
                         )
 
                     if st.button(
@@ -2525,7 +2635,12 @@ elif page=="MU Template":
                         width="stretch",
                     ):
                         ok, message = add_feeder_to_mu_template(
-                            con, selected_row["id"], year, month, sec
+                            con,
+                            selected_row["id"],
+                            year,
+                            month,
+                            sec,
+                            initial_reading=initial_reading,
                         )
                         if ok:
                             st.success(f"{message} added to {label}.")
