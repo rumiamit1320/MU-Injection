@@ -1409,7 +1409,11 @@ def month_energy_summary(con, year, month):
     for row in rows:
         mu = calculate_mu(con, row, year, month)
         if mu is not None:
-            totals[row["entry_type"]] += mu
+            # Historical Excel section is authoritative for the Circle report.
+            # Do not use the current feeder-master entry_type because it can be
+            # changed later without changing the historical workbook section.
+            section = row["report_section"] if row["report_section"] in ("A", "B", "C") else row["entry_type"]
+            totals[section] += mu
     totals["NET"] = totals["A"] + totals["B"] - totals["C"]
     return totals
 
@@ -2161,8 +2165,9 @@ else:
         for r in rows:
             mu=calculate_mu(con,r,year,month)
             if mu is not None:
-                counts[r["entry_type"]]+=1
-                totals[r["entry_type"]]+=mu
+                section = r["report_section"] if r["report_section"] in ("A", "B", "C") else r["entry_type"]
+                counts[section]+=1
+                totals[section]+=mu
         net=totals["A"]+totals["B"]-totals["C"]
 
         cols=st.columns(4)
