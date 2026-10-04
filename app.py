@@ -1280,12 +1280,12 @@ def get_report_reading_rows(con, year, month):
     return rows
 
 def _is_mu_template_pending(row):
-    # Some legacy/read-only queries only select the feeder master fields.
-    # Missing monthly columns must therefore be treated as "not a template
-    # placeholder", not as an exception.
-    if row["reading_id"] is None:
-        return False
+    # Some report/template queries do not include reading_id. Treat a row
+    # without monthly-reading fields as a normal non-pending row.
     keys = row.keys()
+    reading_id = row["reading_id"] if "reading_id" in keys else None
+    if reading_id is None:
+        return False
     direct_mu = row["direct_mu"] if "direct_mu" in keys else None
     reading_kwh = row["reading_kwh"] if "reading_kwh" in keys else None
     remarks = row["remarks"] if "remarks" in keys else None
@@ -1296,7 +1296,9 @@ def _is_mu_template_pending(row):
     )
 
 def calculate_mu(con, row, year, month):
-    if row["reading_id"] is None or _is_mu_template_pending(row):
+    keys = row.keys()
+    reading_id = row["reading_id"] if "reading_id" in keys else None
+    if reading_id is None or _is_mu_template_pending(row):
         return None
     # A direct MU entry is a month-specific fallback for lost/defective meters.
     # It is stored as a positive magnitude; report logic applies Import/Export sign.
