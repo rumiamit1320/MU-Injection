@@ -1053,7 +1053,8 @@ def division_report(con,year,month,division_name):
                                m.baseline_reading_kwh,m.source_feeder_name,m.source_meter_no,
                                f.feeder_name,f.meter_no,f.mf,f.voltage_kv,
                                r.reading_kwh AS master_reading,r.direct_mu AS master_direct_mu,
-                               dr.reading_kwh AS row_reading
+                               dr.reading_kwh AS row_reading,dr.last_reading_kwh AS row_last_reading,
+                               dr.meter_no AS row_meter_no,dr.mf AS row_mf,dr.voltage_kv AS row_voltage_kv
                         FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
                         LEFT JOIN monthly_readings r ON r.feeder_id=f.id AND r.year=? AND r.month=?
                         LEFT JOIN division_row_readings dr ON dr.division_map_id=m.id AND dr.year=? AND dr.month=?
@@ -1081,10 +1082,18 @@ def division_report(con,year,month,division_name):
         base=rowmaps[0]
         present=base["row_reading"]
         flows={x["flow_direction"] for x in rowmaps}
-        if not isinstance(ws.cell(rr,2),MergedCell): ws.cell(rr,2).value=base["source_feeder_name"] or base["feeder_name"]
-        if not isinstance(ws.cell(rr,3),MergedCell): ws.cell(rr,3).value=base["voltage_kv"]
-        if not isinstance(ws.cell(rr,4),MergedCell): ws.cell(rr,4).value=base["source_meter_no"] or base["meter_no"]
-        if not isinstance(ws.cell(rr,5),MergedCell): ws.cell(rr,5).value=base["mf"]
+        template_row=con.execute("""SELECT report_feeder_name,report_meter_no,report_mf,voltage_kv
+                                    FROM division_row_template
+                                    WHERE division_id=? AND sheet_row=? AND flow_direction=? LIMIT 1""",
+                                    (div_id,base["sheet_row"],base["flow_direction"])).fetchone() if base["sheet_row"]>0 else None
+        report_name=(template_row["report_feeder_name"] if template_row is not None else None) or base["source_feeder_name"] or base["feeder_name"]
+        report_meter=base["row_meter_no"] or base["source_meter_no"] or base["meter_no"]
+        report_mf=base["row_mf"] if base["row_mf"] is not None else ((template_row["report_mf"] if template_row is not None else None) or base["mf"])
+        report_voltage=base["row_voltage_kv"] if base["row_voltage_kv"] is not None else ((template_row["voltage_kv"] if template_row is not None else None) or base["voltage_kv"])
+        if not isinstance(ws.cell(rr,2),MergedCell): ws.cell(rr,2).value=report_name
+        if not isinstance(ws.cell(rr,3),MergedCell): ws.cell(rr,3).value=report_voltage
+        if not isinstance(ws.cell(rr,4),MergedCell): ws.cell(rr,4).value=report_meter
+        if not isinstance(ws.cell(rr,5),MergedCell): ws.cell(rr,5).value=report_mf
         if present is None: continue
 
         direct_mu=base["master_direct_mu"]
@@ -1094,7 +1103,9 @@ def division_report(con,year,month,division_name):
             ws.cell(rr,12).value=signed
             continue
 
-        prev=get_previous_division_reading(con,base["map_id"],base["feeder_id"],year,month,base["baseline_reading_kwh"])
+        prev=base["row_last_reading"]
+        if prev is None:
+            prev=get_previous_division_reading(con,base["map_id"],base["feeder_id"],year,month,base["baseline_reading_kwh"])
         if prev is None: continue
         ws.cell(rr,6).value=prev
         ws.cell(rr,7).value=present
