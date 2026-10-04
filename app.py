@@ -2138,7 +2138,6 @@ elif page=="Feeder Master":
     search_text=st.text_input(
         "Search feeder master",
         placeholder="Search by feeder name or meter number",
-        type="search",
         key="feeder_master_search",
     )
     rows=get_feeders(con,active_only=True)
