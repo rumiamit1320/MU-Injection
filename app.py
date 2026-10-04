@@ -24,6 +24,7 @@ from openpyxl.cell.cell import MergedCell
 import openpyxl
 import streamlit as st
 import pandas as pd
+import altair as alt
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "mu_injection.db"
@@ -2035,9 +2036,29 @@ else:
             })
             y,m=previous_period(y,m)
         trend.reverse()
-        trend_df=pd.DataFrame(trend).sort_values("Date")
-        chart_df=trend_df.set_index("Date").drop(columns=["Month"])
-        st.line_chart(chart_df,width="stretch")
+        trend_df=pd.DataFrame(trend).sort_values("Date").reset_index(drop=True)
+        chart_long=trend_df.melt(
+            id_vars=["Month","Date"],
+            value_vars=["A — GSS","B — Other circle","C — Export","Net injection"],
+            var_name="Series",
+            value_name="MU",
+        )
+        month_order=trend_df["Month"].tolist()
+        chart=alt.Chart(chart_long).mark_line(point=True).encode(
+            x=alt.X(
+                "Month:N",
+                sort=month_order,
+                axis=alt.Axis(title=None, labelAngle=0, labelOverlap=False),
+            ),
+            y=alt.Y("MU:Q", title="MU"),
+            color=alt.Color("Series:N", title=None),
+            tooltip=[
+                alt.Tooltip("Month:N", title="Month"),
+                alt.Tooltip("Series:N", title="Series"),
+                alt.Tooltip("MU:Q", title="MU", format=".4f"),
+            ],
+        ).properties(height=360)
+        st.altair_chart(chart,width="stretch")
         st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
 
     else:
@@ -2071,7 +2092,27 @@ else:
             })
             y,m=previous_period(y,m)
         trend.reverse()
-        trend_df=pd.DataFrame(trend).sort_values("Date")
-        chart_df=trend_df.set_index("Date").drop(columns=["Month"])
-        st.line_chart(chart_df,width="stretch")
+        trend_df=pd.DataFrame(trend).sort_values("Date").reset_index(drop=True)
+        chart_long=trend_df.melt(
+            id_vars=["Month","Date"],
+            value_vars=["Import (MWh)","Export (MWh)","Net injection (MWh)"],
+            var_name="Series",
+            value_name="MWh",
+        )
+        month_order=trend_df["Month"].tolist()
+        chart=alt.Chart(chart_long).mark_line(point=True).encode(
+            x=alt.X(
+                "Month:N",
+                sort=month_order,
+                axis=alt.Axis(title=None, labelAngle=0, labelOverlap=False),
+            ),
+            y=alt.Y("MWh:Q", title="MWh"),
+            color=alt.Color("Series:N", title=None),
+            tooltip=[
+                alt.Tooltip("Month:N", title="Month"),
+                alt.Tooltip("Series:N", title="Series"),
+                alt.Tooltip("MWh:Q", title="MWh", format=".4f"),
+            ],
+        ).properties(height=360)
+        st.altair_chart(chart,width="stretch")
         st.dataframe(trend_df.drop(columns=["Date"]),width="stretch",hide_index=True)
