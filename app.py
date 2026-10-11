@@ -825,8 +825,8 @@ def detect_workbook_reporting_period(ws):
     text = " ".join(header_text)
     month_names = "|".join(calendar.month_name[m] for m in range(1, 13))
     patterns = [
-        rf"for\\s+the\\s+month\\s+of\\s+({month_names})\\s*,?\\s*(20\\d{{2}})",
-        rf"\\b({month_names})\\s*,?\\s*(20\\d{{2}})\\b",
+        rf"for\s+the\s+month\s+of\s+({month_names})\s*,?\s*(20\d{{2}})",
+        rf"\b({month_names})\s*,?\s*(20\d{{2}})\b",
     ]
     for pattern in patterns:
         matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
