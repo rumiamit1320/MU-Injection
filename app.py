@@ -26,6 +26,24 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 
+# A mutation sets this flag before rerunning. Clear data-entry widget values at
+# the start of the next run so Streamlit displays values from the latest DB rows.
+_DATA_WIDGET_STATE_PREFIXES = (
+    "edit_", "saveedit_", "new_", "fn_", "mn_", "mf_", "dv_", "sd_",
+    "tp_", "ed_", "vg_", "ir_", "direct_mu_value_", "direct_mu_note_",
+    "direct_mu_select_", "entry_page_",
+)
+
+if st.session_state.pop("_refresh_current_status", False):
+    for _state_key in list(st.session_state.keys()):
+        if _state_key.startswith(_DATA_WIDGET_STATE_PREFIXES):
+            st.session_state.pop(_state_key, None)
+
+def refresh_current_status():
+    """Re-query the database and reset stale data widgets on the next run."""
+    st.session_state["_refresh_current_status"] = True
+    st.rerun()
+
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "mu_injection.db"
 TEMPLATE_PATH = APP_DIR / "MU_Injection_Template.xlsx"
@@ -2559,7 +2577,7 @@ if page=="Enter Readings":
                         )
                         if c5.button("Save",key=f"save_{sec}_{year}_{month}_{row['id']}",type="primary"):
                             save_reading(con,row["id"],year,month,reading)
-                            st.rerun()
+                            refresh_current_status()
 
                     st.caption(f"Showing feeders {(p-1)*10+1}–{min(p*10,len(pending))} of {len(pending)} pending.")
 
@@ -2607,7 +2625,7 @@ if page=="Enter Readings":
                                         key=f"dnew_{division_name}_{year}_{month}_{row['division_map_id']}")
                 if c5.button("Save",key=f"dsave_{division_name}_{year}_{month}_{row['division_map_id']}",type="primary"):
                     save_division_reading(con,row["division_map_id"],year,month,reading)
-                    st.rerun()
+                    refresh_current_status()
             st.caption(f"Showing feeders {(pno-1)*10+1}–{min(pno*10,len(pending))} of {len(pending)} pending.")
 
 
@@ -2666,7 +2684,7 @@ elif page=="Direct MU Entry":
                                VALUES(?,?,?,?,?,?,?)
                                ON CONFLICT(feeder_id,year,month) DO UPDATE SET direct_mu=excluded.direct_mu,direct_mu_note=excluded.direct_mu_note,remarks=excluded.remarks,updated_at=CURRENT_TIMESTAMP""",
                             (row['id'],year,month,float(row['reading_kwh'] or 0),"Direct MU fallback",float(mu),note))
-                con.commit(); st.success("Direct MU saved."); st.rerun()
+                con.commit(); st.success("Direct MU saved."); refresh_current_status()
             st.info("Enter MU as a positive magnitude. IMPORT contributes positively; EXPORT is subtracted automatically in division net injection.")
 
 # ---------- ALL FEEDER READINGS ----------
@@ -2693,7 +2711,7 @@ elif page=="All Feeder Readings":
                                           format="%.3f",key=f"edit_{row['id']}_{year}_{month}")
                     if c6.button("Save",key=f"saveedit_{row['id']}_{year}_{month}"):
                         save_reading(con,row["id"],year,month,value,row["remarks"] or "")
-                        st.rerun()
+                        refresh_current_status()
                 else:
                     c5.write("**Not entered**")
                     c6.write("Pending")
@@ -2727,7 +2745,7 @@ elif page=="Feeder Master":
                     try:
                         add_feeder(con,feeder,meter,mf,SELECTION_TO_ENTRY_TYPE[typ_label],initial,division,None if subdivision_label=="None" else subdivision_label,voltage,energy_direction,typ_label)
                         st.success("Feeder added.")
-                        st.rerun()
+                        refresh_current_status()
                     except sqlite3.IntegrityError:
                         st.error("This meter number already exists for this selection.")
 
@@ -2780,13 +2798,13 @@ elif page=="Feeder Master":
                     try:
                         update_feeder(con,row["id"],feeder,meter,mf,SELECTION_TO_ENTRY_TYPE[typ],initial,division,None if subdivision_label=="None" else subdivision_label,voltage,energy_direction,typ,year,month)
                         st.success("Feeder updated.")
-                        st.rerun()
+                        refresh_current_status()
                     except sqlite3.IntegrityError:
                         st.error("This meter number already exists for that selection.")
                 if delete.form_submit_button("Delete feeder",width="stretch"):
                     delete_feeder(con,row["id"])
                     st.success("Feeder deleted.")
-                    st.rerun()
+                    refresh_current_status()
 
 # ---------- MU TEMPLATE ----------
 elif page=="MU Template":
