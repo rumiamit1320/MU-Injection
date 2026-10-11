@@ -2992,6 +2992,7 @@ elif page=="Import Excel":
                     with st.expander("View skipped rows"):
                         for item in result["skipped"]:
                             st.write(f"• {item}")
+                refresh_current_status()
             except Exception as exc:
                 st.error(f"Import failed: {exc}")
 
