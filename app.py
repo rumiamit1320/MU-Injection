@@ -810,6 +810,33 @@ def ensure_division_template_reference(con):
                             (item["subdivision"],fid,item["feeder_name"],item["meter_no"],existing["id"]))
     con.commit()
 
+def detect_workbook_reporting_period(ws):
+    """Detect the reporting month/year stated in a workbook header.
+
+    Prefer 'For the month of ...' over any later billed-in month so historical
+    workbooks cannot accidentally be imported into the currently selected month.
+    Returns (year, month) or None when no unambiguous period is present.
+    """
+    header_text = []
+    for row in ws.iter_rows(min_row=1, max_row=min(6, ws.max_row),
+                            min_col=1, max_col=min(8, ws.max_column),
+                            values_only=True):
+        header_text.append(" ".join(str(v).strip() for v in row if v is not None))
+    text = " ".join(header_text)
+    month_names = "|".join(calendar.month_name[m] for m in range(1, 13))
+    patterns = [
+        rf"for\\s+the\\s+month\\s+of\\s+({month_names})\\s*,?\\s*(20\\d{{2}})",
+        rf"\\b({month_names})\\s*,?\\s*(20\\d{{2}})\\b",
+    ]
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
+        if matches:
+            match = matches[0]
+            month_name = match.group(1).capitalize()
+            return int(match.group(2)), list(calendar.month_name).index(month_name)
+    return None
+
+
 def import_division_workbook(con, uploaded_bytes, year, month, division_name, overwrite=False):
     if division_name not in DIVISIONS:
         raise ValueError("Unknown division.")
@@ -818,6 +845,14 @@ def import_division_workbook(con, uploaded_bytes, year, month, division_name, ov
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Workbook does not contain the '{sheet_name}' sheet.")
     ws=wb[sheet_name]
+    detected_period = detect_workbook_reporting_period(ws)
+    if detected_period is not None and detected_period != (int(year), int(month)):
+        detected_year, detected_month = detected_period
+        raise ValueError(
+            f"This workbook is for {calendar.month_name[detected_month]} {detected_year}, "
+            f"but the selected import period is {calendar.month_name[int(month)]} {int(year)}. "
+            "Select the reporting month shown in the workbook. No data was imported."
+        )
     div_id=DIVISION_TO_ID[division_name]
     ensure_division_template_reference(con)
     refs=con.execute("""SELECT * FROM division_row_template
@@ -1604,6 +1639,14 @@ def import_month_excel(con, uploaded_bytes, year, month, overwrite=False):
     wb_values = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=True)
     ws = wb["MU inj JEC"] if "MU inj JEC" in wb.sheetnames else wb.active
     ws_values = wb_values["MU inj JEC"] if "MU inj JEC" in wb_values.sheetnames else wb_values.active
+    detected_period = detect_workbook_reporting_period(ws)
+    if detected_period is not None and detected_period != (int(year), int(month)):
+        detected_year, detected_month = detected_period
+        raise ValueError(
+            f"This workbook is for {calendar.month_name[detected_month]} {detected_year}, "
+            f"but the selected import period is {calendar.month_name[int(month)]} {int(year)}. "
+            "Select the reporting month shown in the workbook. No data was imported."
+        )
     imported = []
     skipped = []
     updated_master = 0
