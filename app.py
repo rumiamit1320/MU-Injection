@@ -1010,16 +1010,39 @@ def import_division_workbook(con, uploaded_bytes, year, month, division_name, ov
 
 
 def import_all_division_workbook(con, uploaded_bytes, year, month, overwrite=False):
+    """Import only division sheets whose stated reporting period matches the selection.
+
+    Some historical all-division workbooks contain sheets from different months.
+    A mismatched sheet is reported as skipped instead of aborting imports from
+    other sheets that correctly match the requested month/year.
+    """
     wb = openpyxl.load_workbook(io.BytesIO(uploaded_bytes), data_only=False)
     results = []
+    skipped_sheets = []
     for division_name, sheet_name in DIVISIONS.items():
-        if sheet_name in wb.sheetnames:
-            results.append(
-                import_division_workbook(
-                    con, uploaded_bytes, year, month, division_name, overwrite
-                )
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        detected_period = detect_workbook_reporting_period(ws)
+        if detected_period is not None and detected_period != (int(year), int(month)):
+            detected_year, detected_month = detected_period
+            skipped_sheets.append(
+                f"{division_name} ({sheet_name}): sheet is for "
+                f"{calendar.month_name[detected_month]} {detected_year}, not "
+                f"{calendar.month_name[int(month)]} {int(year)}; sheet was not imported."
             )
+            continue
+        results.append(
+            import_division_workbook(
+                con, uploaded_bytes, year, month, division_name, overwrite
+            )
+        )
     if not results:
+        if skipped_sheets:
+            raise ValueError(
+                f"No division sheets matched {calendar.month_name[int(month)]} {int(year)}. "
+                + " ".join(skipped_sheets)
+            )
         raise ValueError("No Jorhat division sheets were found in the uploaded workbook.")
     return {
         "divisions": len(results),
@@ -1027,7 +1050,7 @@ def import_all_division_workbook(con, uploaded_bytes, year, month, overwrite=Fal
         "reused": sum(x["reused"] for x in results),
         "new_master": sum(x["new_master"] for x in results),
         "mapped": sum(x["mapped"] for x in results),
-        "skipped": [item for x in results for item in x["skipped"]],
+        "skipped": skipped_sheets + [item for x in results for item in x["skipped"]],
     }
 
 
