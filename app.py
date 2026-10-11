@@ -2555,7 +2555,7 @@ if page=="Feeder wise MU":
                        prev.reading_kwh AS previous_reading,
                        cur.id AS current_reading_id,
                        prev.id AS previous_reading_id,
-                       cur.remarks AS current_remarks,
+                       NULL AS current_remarks,
                        m.sub_division, m.sheet_row
                 FROM division_row_map m
                 JOIN feeder_master f ON f.id=m.feeder_id
