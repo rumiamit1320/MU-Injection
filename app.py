@@ -2500,6 +2500,7 @@ with st.sidebar:
     st.markdown("### Pages")
     pages=[
         "Enter Readings",
+        "Feeder wise MU",
         "Direct MU Entry",
         "All Feeder Readings",
         "Feeder Master",
@@ -2517,6 +2518,111 @@ with st.sidebar:
 
 # The selected period is now known; seed a new month from the current MU Template.
 ensure_mu_template_for_month(con, year, month)
+
+# ---------- FEEDER-WISE MU ----------
+if page=="Feeder wise MU":
+    scope_label = CIRCLE_NAME if scope=="Circle" else division_name
+    st.subheader(f"Feeder wise MU — {scope_label} — {calendar.month_name[month]} {year}")
+    st.caption("MU = (current-month reading − previous-month reading) × MF ÷ 1000. Both readings are taken from the selected month and its immediately preceding calendar month.")
+    previous_year, previous_month = previous_period(year, month)
+
+    if scope == "Circle":
+        rows = con.execute("""
+            SELECT f.id AS feeder_id, f.feeder_name, f.meter_no, f.mf,
+                   f.entry_type, f.energy_direction,
+                   cur.reading_kwh AS current_reading,
+                   prev.reading_kwh AS previous_reading,
+                   cur.id AS current_reading_id,
+                   prev.id AS previous_reading_id,
+                   cur.remarks AS current_remarks
+            FROM feeder_master f
+            LEFT JOIN monthly_readings cur
+              ON cur.feeder_id=f.id AND cur.year=? AND cur.month=?
+            LEFT JOIN monthly_readings prev
+              ON prev.feeder_id=f.id AND prev.year=? AND prev.month=?
+            WHERE f.active=1
+            ORDER BY f.entry_type,f.feeder_name,f.meter_no
+        """, (year, month, previous_year, previous_month)).fetchall()
+    else:
+        div_id = get_division_id(con, division_name)
+        if div_id is None:
+            rows = []
+        else:
+            rows = con.execute("""
+                SELECT f.id AS feeder_id, f.feeder_name, f.meter_no, f.mf,
+                       f.entry_type, f.energy_direction,
+                       cur.reading_kwh AS current_reading,
+                       prev.reading_kwh AS previous_reading,
+                       cur.id AS current_reading_id,
+                       prev.id AS previous_reading_id,
+                       cur.remarks AS current_remarks,
+                       m.sub_division, m.sheet_row
+                FROM division_row_map m
+                JOIN feeder_master f ON f.id=m.feeder_id
+                LEFT JOIN division_row_readings cur
+                  ON cur.division_map_id=m.id AND cur.year=? AND cur.month=?
+                LEFT JOIN division_row_readings prev
+                  ON prev.division_map_id=m.id AND prev.year=? AND prev.month=?
+                WHERE m.division_id=? AND m.active=1 AND f.active=1
+                ORDER BY m.sub_division,m.sheet_row,m.id
+            """, (year, month, previous_year, previous_month, div_id)).fetchall()
+
+    search = st.text_input(
+        "Search feeder or meter number",
+        placeholder="Search by feeder name or meter number…",
+        key=f"feeder_mu_search_{scope}_{division_name}_{year}_{month}"
+    ).strip().casefold()
+    report_rows = []
+    total_mu = 0.0
+    complete = 0
+    pending = 0
+    for row in rows:
+        if search and search not in str(row["feeder_name"] or "").casefold() and search not in str(row["meter_no"] or "").casefold():
+            continue
+        current = row["current_reading"]
+        previous = row["previous_reading"]
+        remarks = row["current_remarks"] if "current_remarks" in row.keys() else ""
+        is_placeholder = (
+            current is not None
+            and float(current or 0) == 0.0
+            and str(remarks or "").startswith("Added from MU Template")
+        )
+        mu = None
+        if row["current_reading_id"] is not None and row["previous_reading_id"] is not None and not is_placeholder:
+            mu = (float(current) - float(previous)) * float(row["mf"] or 1.0) / 1000.0
+            total_mu += mu
+            complete += 1
+        else:
+            pending += 1
+        report_rows.append({
+            "Feeder Name": row["feeder_name"],
+            "Meter Number": row["meter_no"],
+            "MF": float(row["mf"] or 1.0),
+            "Previous Month Reading (kWh)": None if previous is None else float(previous),
+            "Current Month Reading (kWh)": None if current is None or is_placeholder else float(current),
+            "MU": mu,
+            "Status": "Calculated" if mu is not None else (
+                "Current reading missing" if current is None or is_placeholder
+                else "Previous-month reading missing"
+            ),
+        })
+
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Feeders shown", len(report_rows))
+    c2.metric("MU calculated", complete)
+    c3.metric("Total MU", f"{total_mu:,.6f}")
+    st.caption(f"Previous period: {calendar.month_name[previous_month]} {previous_year}")
+    if report_rows:
+        st.dataframe(pd.DataFrame(report_rows), width="stretch", hide_index=True)
+        st.download_button(
+            "Download feeder-wise MU (CSV)",
+            data=pd.DataFrame(report_rows).to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"feeder_wise_mu_{year}_{month:02d}_{scope.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    else:
+        st.info("No feeders match the current scope and search.")
 
 # ---------- ENTER READINGS ----------
 if page=="Enter Readings":
