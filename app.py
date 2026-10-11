@@ -3065,7 +3065,7 @@ elif page=="Delete Month Data":
                 f"{deleted['division_row_readings']} Division readings, and "
                 f"{deleted['meter_change_history']} meter-change records."
             )
-            st.rerun()
+            refresh_current_status()
         except Exception as exc:
             st.error(f"Delete failed: {exc}")
 
