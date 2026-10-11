@@ -2712,6 +2712,9 @@ elif page=="All Feeder Readings":
                     if c6.button("Save",key=f"saveedit_{row['id']}_{year}_{month}"):
                         save_reading(con,row["id"],year,month,value,row["remarks"] or "")
                         refresh_current_status()
+                    if c6.button("Delete",key=f"deletereading_{row['id']}_{year}_{month}"):
+                        delete_reading(con,row["id"],year,month)
+                        refresh_current_status()
                 else:
                     c5.write("**Not entered**")
                     c6.write("Pending")
