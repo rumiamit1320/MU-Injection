@@ -1031,10 +1031,10 @@ def get_scope_rows(con, year, month, scope, division_name=None):
         return []
     return con.execute(
         '''SELECT m.id AS id,m.id AS division_map_id,m.sheet_row,m.sub_division,m.flow_direction,
-                  COALESCE(t.report_feeder_name,m.source_feeder_name,f.feeder_name) AS feeder_name,
-                  COALESCE(dr.meter_no,m.source_meter_no,f.meter_no) AS meter_no,
-                  COALESCE(dr.mf,f.mf,t.report_mf) AS mf,
-                  COALESCE(dr.voltage_kv,f.voltage_kv,t.voltage_kv) AS voltage_kv,
+                  COALESCE(f.feeder_name,t.report_feeder_name,m.source_feeder_name) AS feeder_name,
+                  COALESCE(f.meter_no,dr.meter_no,m.source_meter_no) AS meter_no,
+                  COALESCE(f.mf,dr.mf,t.report_mf) AS mf,
+                  COALESCE(f.voltage_kv,dr.voltage_kv,t.voltage_kv) AS voltage_kv,
                   dr.reading_kwh AS reading_kwh,
                   CASE WHEN dr.reading_kwh IS NULL THEN NULL ELSE m.id END AS reading_id,
                   f.entry_type,f.energy_direction,NULL AS remarks,NULL AS direct_mu,NULL AS direct_mu_note
@@ -2589,12 +2589,12 @@ if page=="Enter Readings":
             rows=[]
         else:
             rows=con.execute("""SELECT m.id AS division_map_id,m.sheet_row,m.sub_division,m.flow_direction,
-                                      COALESCE(t.report_feeder_name,m.source_feeder_name,f.feeder_name) AS source_feeder_name,
-                                      COALESCE(dr.meter_no,m.source_meter_no,f.meter_no) AS source_meter_no,
+                                      COALESCE(f.feeder_name,t.report_feeder_name,m.source_feeder_name) AS source_feeder_name,
+                                      COALESCE(f.meter_no,dr.meter_no,m.source_meter_no) AS source_meter_no,
                                       m.baseline_reading_kwh,
                                       f.id AS feeder_id,
-                                      COALESCE(dr.mf,f.mf,t.report_mf) AS mf,
-                                      COALESCE(dr.voltage_kv,f.voltage_kv,t.voltage_kv) AS voltage_kv,
+                                      COALESCE(f.mf,dr.mf,t.report_mf) AS mf,
+                                      COALESCE(f.voltage_kv,dr.voltage_kv,t.voltage_kv) AS voltage_kv,
                                       dr.reading_kwh AS row_reading
                                FROM division_row_map m JOIN feeder_master f ON f.id=m.feeder_id
                                LEFT JOIN division_row_template t
