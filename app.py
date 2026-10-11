@@ -2519,7 +2519,7 @@ if page=="Enter Readings":
             for tab,sec in zip(types,["A","B","C"]):
                 with tab:
                     all_rows=con.execute("""
-                        SELECT f.*,r.id reading_id
+                        SELECT f.*,r.id reading_id,r.reading_kwh,r.remarks,r.direct_mu,r.direct_mu_note
                         FROM feeder_master f
                         LEFT JOIN monthly_readings r
                           ON r.feeder_id=f.id AND r.year=? AND r.month=?
